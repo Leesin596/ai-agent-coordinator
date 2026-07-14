@@ -1,0 +1,31 @@
+node_modules/
+dist/
+.coordinator/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.db.lock
+src/**/*.js
+src/**/*.js.map
+src/**/*.d.ts
+
+# VSCode extension build artifacts
+vscode-extension/out/
+vscode-extension/dist/
+vscode-extension/lib/
+vscode-extension/node_modules/
+vscode-extension/*.vsix
+vscode-extension/tsc_check.txt
+
+# Windows reserved name artifact
+nul
+
+# Local AI/IDE state
+.workbuddy/
+
+# IDE
+.idea/
+*.swp
+*.swo
+.DS_Store

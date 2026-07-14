@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ai-agent-coordinator": {
+      "command": "npx",
+      "args": ["tsx", "src/mcp/server.ts"],
+      "cwd": ".",
+      "env": {
+        "COORDINATOR_DB": ".coordinator/coordinator.db"
+      }
+    }
+  }
+}

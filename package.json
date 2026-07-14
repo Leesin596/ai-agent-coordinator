@@ -1,0 +1,59 @@
+{
+  "name": "ai-agent-coordinator",
+  "version": "0.1.0",
+  "description": "Lightweight local coordinator for multi-AI-agent collaboration",
+  "main": "dist/index.js",
+  "license": "MIT",
+  "author": "Leesin596",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Leesin596/ai-agent-coordinator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Leesin596/ai-agent-coordinator/issues"
+  },
+  "homepage": "https://github.com/Leesin596/ai-agent-coordinator#readme",
+  "keywords": [
+    "ai-agent",
+    "multi-agent",
+    "coordinator",
+    "mcp",
+    "model-context-protocol",
+    "task-management",
+    "contract-registry",
+    "collaboration",
+    "windsurf",
+    "cursor",
+    "copilot"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc && npm run build:assets",
+    "build:assets": "node -e \"const fs=require('fs');fs.cpSync('src/public','dist/public',{recursive:true});fs.cpSync('src/skills','dist/skills',{recursive:true});fs.copyFileSync('src/db/schema.sql','dist/db/schema.sql')\"",
+    "start": "node dist/index.js",
+    "mcp": "tsx src/mcp/server.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "express": "^4.21.0",
+    "json-schema-diff": "^0.18.0",
+    "sql.js": "^1.14.1",
+    "ws": "^8.18.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^18.19.0",
+    "@types/sql.js": "^1.4.11",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.6"
+  }
+}

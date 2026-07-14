@@ -1,0 +1,53 @@
+# 源码（打包只需编译产物）
+src/**
+tsconfig.json
+
+# 开发配置
+.vscode/**
+.vscodeignore
+
+# 构建脚本（运行时不需要）
+build.js
+
+# 旧构建产物（esbuild 统一打到 out/）
+dist/**
+lib/**
+
+# 旧的 vsix 产物
+*.vsix
+
+# 根项目引用（防止误打包父目录）
+../**
+
+# node_modules 瘦身
+node_modules/**/*.md
+node_modules/**/*.map
+node_modules/**/*.ts
+node_modules/**/.npmignore
+node_modules/**/package-lock.json
+
+# sql.js 运行时只需 sql-wasm.js + sql-wasm.wasm（约 700KB），其余 15MB 全删
+node_modules/sql.js/dist/sql-asm.js
+node_modules/sql.js/dist/sql-asm.js.*
+node_modules/sql.js/dist/sql-asm-debug.js
+node_modules/sql.js/dist/sql-asm-memory-growth.js
+node_modules/sql.js/dist/sql-wasm-browser.js
+node_modules/sql.js/dist/sql-wasm-browser.wasm
+node_modules/sql.js/dist/sql-wasm-browser-debug.js
+node_modules/sql.js/dist/sql-wasm-browser-debug.wasm
+node_modules/sql.js/dist/sql-wasm-debug.js
+node_modules/sql.js/dist/sql-wasm-debug.wasm
+node_modules/sql.js/dist/worker.sql-asm.js
+node_modules/sql.js/dist/worker.sql-asm-debug.js
+node_modules/sql.js/dist/worker.sql-wasm.js
+node_modules/sql.js/dist/worker.sql-wasm-debug.js
+node_modules/sql.js/.eslintrc.js
+node_modules/sql.js/.jsdoc.config.json
+node_modules/sql.js/.nojekyll
+node_modules/sql.js/.devcontainer/**
+node_modules/sql.js/AUTHORS
+node_modules/sql.js/eslint.config.cjs
+node_modules/sql.js/logo.svg
+node_modules/sql.js/examples/**
+node_modules/sql.js/test/**
+node_modules/sql.js/docs/**

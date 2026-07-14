@@ -1,0 +1,261 @@
+{
+  "name": "ai-agent-coordinator",
+  "displayName": "AI Agent Coordinator",
+  "description": "Multi-AI Agent Collaboration Coordinator",
+  "version": "0.1.0",
+  "license": "MIT",
+  "publisher": "Leesin596",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "scripts": {
+    "build": "npm run typecheck && node build.js --prod",
+    "watch": "node build.js --watch",
+    "compile": "npm run build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "sql.js": "^1.13.0"
+  },
+  "devDependencies": {
+    "@types/sql.js": "^1.4.9",
+    "@types/vscode": "1.85.0",
+    "@types/node": "^18.19.0",
+    "esbuild": "^0.28.1",
+    "typescript": "^5.7.0"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "coordinator.openPanel",
+        "title": "Open Coordinator",
+        "icon": "$(hub)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.openDashboard",
+        "title": "Open Dashboard",
+        "icon": "$(dashboard)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.addEditorContext",
+        "title": "添加选中代码或当前文件到输入框",
+        "shortTitle": "添加代码上下文",
+        "icon": "$(references)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.addFileContext",
+        "title": "添加文件到输入框",
+        "shortTitle": "添加文件上下文",
+        "icon": "$(file-code)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.pickContext",
+        "title": "选择代码上下文添加到输入框",
+        "shortTitle": "添加上下文",
+        "icon": "$(attach)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.addWorkspace",
+        "title": "Add Workspace",
+        "icon": "$(add)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.switchWorkspace",
+        "title": "Switch Workspace",
+        "icon": "$(arrow-swap)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.renameWorkspace",
+        "title": "Rename Workspace",
+        "icon": "$(edit)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.removeWorkspace",
+        "title": "Remove Workspace",
+        "icon": "$(trash)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.refreshWorkspaces",
+        "title": "Refresh Workspaces",
+        "icon": "$(refresh)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.addRole",
+        "title": "Add Role",
+        "icon": "$(add)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.editRole",
+        "title": "Edit Role",
+        "icon": "$(edit)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.deleteRole",
+        "title": "Delete Role",
+        "icon": "$(trash)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.refreshRoles",
+        "title": "Refresh Roles",
+        "icon": "$(refresh)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.refreshBuiltInRoles",
+        "title": "刷新内置角色到最新版本",
+        "icon": "$(sync)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.refreshSessions",
+        "title": "Refresh Sessions",
+        "icon": "$(refresh)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.startSession",
+        "title": "Start Session",
+        "icon": "$(play)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.openSession",
+        "title": "Open Session",
+        "icon": "$(comment-discussion)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.listSessions",
+        "title": "List Sessions",
+        "icon": "$(list-unordered)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.deleteSession",
+        "title": "Delete Session",
+        "icon": "$(trash)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.openTaskCenter",
+        "title": "Open Task Center",
+        "icon": "$(inbox)",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.dispatchTask",
+        "title": "Dispatch Task",
+        "icon": "$(send)",
+        "category": "Coordinator"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "coordinator-sidebar",
+          "title": "Coordinator",
+          "icon": "media/coordinator.svg"
+        }
+      ],
+      "panel": [
+        {
+          "id": "coordinator-panel",
+          "title": "Coordinator",
+          "icon": "media/coordinator.svg"
+        }
+      ]
+    },
+    "views": {
+      "coordinator-sidebar": [
+        {
+          "type": "webview",
+          "id": "coordinator.sidebar",
+          "name": "Coordinator",
+          "icon": "media/coordinator.svg",
+          "visibility": "visible"
+        }
+      ],
+      "coordinator-panel": [
+        {
+          "type": "webview",
+          "id": "coordinatorConsole",
+          "name": "Coordinator",
+          "contextualTitle": "Coordinator",
+          "icon": "media/coordinator.svg",
+          "visibility": "visible"
+        }
+      ]
+    },
+    "menus": {
+      "editor/title": [
+        {
+          "command": "coordinator.addEditorContext",
+          "when": "resourceScheme == file",
+          "group": "navigation@10"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "coordinator.addEditorContext",
+          "when": "resourceScheme == file",
+          "group": "coordinator@1"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "coordinator.addFileContext",
+          "when": "resourceScheme == file && !explorerResourceIsFolder",
+          "group": "coordinator@1"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "coordinator.openTaskCenter",
+          "when": "view == coordinator.sidebar",
+          "group": "navigation@1"
+        }
+      ],
+      "view/item/context": []
+    },
+    "configuration": {
+      "title": "AI Agent Coordinator",
+      "properties": {
+        "coordinator.llm.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "LLM API Key"
+        },
+        "coordinator.llm.baseURL": {
+          "type": "string",
+          "default": "https://api.openai.com/v1",
+          "description": "LLM API Base URL"
+        },
+        "coordinator.llm.model": {
+          "type": "string",
+          "default": "gpt-4o-mini",
+          "description": "Default LLM Model"
+        }
+      }
+    }
+  }
+}
