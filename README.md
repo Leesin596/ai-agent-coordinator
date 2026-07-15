@@ -30,6 +30,59 @@ npm run mcp
 | **WebSocket** | ws :9700/ws | 实时事件推送、订阅、Agent 注册 |
 | **FileSync** | .coordinator/ 目录 | 不支持 API 的 AI 工具通过读文件获取上下文 |
 
+## VS Code 扩展
+
+项目不只是 MCP/REST 服务，还包含一个完整的 VS Code 扩展，提供图形化界面管理任务、角色、会话和模型。
+
+### 功能
+
+- **侧边栏面板** — 工作区管理、角色库、会话列表、任务派发，全部可视化操作
+- **底部控制台** — 实时事件流、Agent 在线状态、事件回放
+- **聊天面板** — 按 role 系统提示词开对话，支持上下文注入和模型切换
+- **任务中心** — 查看和验收跨会话派发的任务
+- **模型管理** — 配置 OpenAI 兼容 API（Key、BaseURL、模型、温度等），支持多预设
+- **内置 15 个角色** — Vue/React/Go/Java/PHP/Python/Rust/测试/代码审计/产品/UI/Agent 简报等，开箱即用
+
+### 安装
+
+**方式一：从 VSIX 安装（推荐）**
+
+1. 从 [GitHub Releases](https://github.com/Leesin596/ai-agent-coordinator/releases) 下载 `ai-agent-coordinator-0.1.0.vsix`
+2. 在 VS Code 中执行：
+   ```
+   code --install-extension ai-agent-coordinator-0.1.0.vsix
+   ```
+3. 重载窗口（`Ctrl+Shift+P` → `Developer: Reload Window`）
+4. 左侧活动栏出现 Coordinator 图标，点击即可使用
+
+**方式二：从源码构建**
+
+```bash
+cd vscode-extension
+npm ci
+npm run build
+# 打包 VSIX
+npx vsce package --no-git-tag-version
+# 安装
+code --install-extension ai-agent-coordinator-0.1.0.vsix
+```
+
+### 配置 LLM
+
+安装后在 VS Code 设置中搜索 `coordinator`：
+
+- `coordinator.llm.apiKey` — LLM API Key（OpenAI 兼容）
+- `coordinator.llm.baseURL` — API Base URL，默认 `https://api.openai.com/v1`
+- `coordinator.llm.model` — 模型名称
+
+也可以在扩展左侧「模型设置」面板中管理多个模型预设，按会话绑定。
+
+### 数据存储
+
+- 全局数据库：`~/.coordinator/global.db`（工作区列表）
+- 工作区数据库：`~/.coordinator/<workspace-id>.db`（任务、契约、记忆、事件、会话）
+- 与根项目共享 `.coordinator/` 目录格式，数据互通
+
 ## Project Namespace 隔离
 
 所有数据支持按 `project` 隔离，不同团队/项目互不干扰：
