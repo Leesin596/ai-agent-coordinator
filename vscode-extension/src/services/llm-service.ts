@@ -125,15 +125,11 @@ export class LLMService {
           fail(new Error(`模型请求调用工具 ${toolCalls.map((call) => call.name).join(', ')}，但当前会话未提供工具执行器`));
           return;
         }
-        if (toolCalls.length > 8 || totalToolCalls + toolCalls.length > 16) {
+        if (toolCalls.length > 8 || totalToolCalls + toolCalls.length > 50) {
           fail(new Error('模型请求的工具调用数量超过安全上限'));
           return;
         }
         totalToolCalls += toolCalls.length;
-        if (round >= 4) {
-          fail(new Error('模型连续工具调用超过 4 轮，已停止以避免循环'));
-          return;
-        }
 
         const nextMessages: LLMMessage[] = [
           ...roundMessages,

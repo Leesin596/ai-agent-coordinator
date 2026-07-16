@@ -348,7 +348,7 @@ export class WorkspaceToolExecutor {
   private runProcess(command: string, args: string[], shell: boolean, timeoutSeconds: number): Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean; truncated: boolean }> {
     return new Promise((resolve, reject) => {
       if (this.cancelled) return reject(new Error('工具执行已取消'));
-      const child = spawn(command, args, { cwd: this.root, shell, windowsHide: true, env: process.env });
+      const child = spawn(command, args, { cwd: this.root, shell, windowsHide: true, env: process.env, detached: process.platform !== 'win32' });
       this.activeProcesses.add(child);
       let stdout = '';
       let stderr = '';
@@ -378,7 +378,11 @@ export class WorkspaceToolExecutor {
     if (process.platform === 'win32') {
       spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
     } else {
-      child.kill('SIGTERM');
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        child.kill('SIGKILL');
+      }
     }
   }
 }

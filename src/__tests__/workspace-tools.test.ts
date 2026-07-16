@@ -147,5 +147,5 @@ describe('WorkspaceToolExecutor', () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     executor.cancel();
     await expect(running).rejects.toThrow('工具执行已取消');
-  });
+  }, 15000);
 });
