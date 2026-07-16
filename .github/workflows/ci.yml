@@ -24,6 +24,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install VS Code extension dependencies
+        run: npm --prefix vscode-extension ci
+
       - name: Run tests
         run: npm test
 
@@ -31,4 +34,4 @@ jobs:
         run: npm run build
 
       - name: Build VS Code extension
-        run: npm --prefix vscode-extension ci && npm --prefix vscode-extension run build
+        run: npm --prefix vscode-extension run build
