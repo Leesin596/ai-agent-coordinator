@@ -5,8 +5,10 @@
 import * as vscode from 'vscode';
 import type { CoordinatorContext, ActiveWorkspaceRuntime } from '../backend/coordinator-context';
 import type { Role, Session } from '../../../src/models/types';
-import { LLMService, estimateMessageTokens, type LLMMessage, type LLMConfig } from '../services/llm-service';
+import { LLMService, estimateMessageTokens, type LLMMessage, type LLMConfig, type LLMToolCall } from '../services/llm-service';
+import { COORDINATOR_LLM_TOOLS } from '../services/llm-api';
 import { buildWorkspaceContext } from '../services/workspace-context';
+import { WorkspaceToolExecutor } from '../services/workspace-tools';
 import {
   buildSessionContextPackage,
   listContextSessionOptions,
@@ -35,6 +37,7 @@ function registerSessionChangeListener(cb: SessionChangeCallback): () => void {
 export class ChatPanel {
   private panel: vscode.WebviewPanel;
   private llm = new LLMService();
+  private toolExecutor: WorkspaceToolExecutor;
   private abortFn: (() => void) | null = null;
   private isStreaming = false;
   private role: Role;
@@ -55,6 +58,14 @@ export class ChatPanel {
     this.runtime = runtime;
     this.role = role;
     this.session = session;
+    this.toolExecutor = new WorkspaceToolExecutor(runtime.workspace.folderPath, async (request) => {
+      const choice = await vscode.window.showWarningMessage(
+        request.title,
+        { modal: true, detail: request.detail },
+        request.confirmLabel,
+      );
+      return choice === request.confirmLabel;
+    });
 
     this.panel.title = `${role.icon || '💬'} ${session.title}`;
 
@@ -210,30 +221,40 @@ export class ChatPanel {
     }
 
     this.sendContextUsage(messages, config.contextWindow);
+    this.toolExecutor.begin();
 
-    this.abortFn = this.llm.streamChat(messages, config, {
+    let usedNativeTool = false;
+    this.abortFn = this.llm.streamChat(messages, { ...config, tools: COORDINATOR_LLM_TOOLS }, {
       onChunk: (delta) => {
         this.sendToWebview({ type: 'streamChunk', delta });
       },
       onReasoningChunk: (delta) => {
         this.sendToWebview({ type: 'reasoningChunk', delta });
       },
+      onToolCall: (call) => {
+        usedNativeTool = true;
+        return this.executeToolCall(call);
+      },
+      onToolStatus: (call, status, detail) => {
+        this.sendToWebview({ type: 'toolStatus', callId: call.id, name: call.name, status, detail });
+      },
       onDone: (fullText, reasoningText) => {
         this.isStreaming = false;
         this.abortFn = null;
-        this.runtime.sessionManager.addMessage(this.session.id, 'assistant', fullText);
+        if (fullText) this.runtime.sessionManager.addMessage(this.session.id, 'assistant', fullText);
         this.sendToWebview({ type: 'streamEnd', fullText, reasoningText });
         this.sendContextUsage(
           [...messages, { content: fullText }],
           config.contextWindow,
         );
         // 自动解析并执行派发指令
-        this.parseAndDispatch(fullText);
+        if (!usedNativeTool) this.parseAndDispatch(fullText);
       },
-      onError: (err) => {
+      onError: (err, fullText, reasoningText) => {
         this.isStreaming = false;
         this.abortFn = null;
-        this.sendToWebview({ type: 'error', message: err.message });
+        if (fullText) this.runtime.sessionManager.addMessage(this.session.id, 'assistant', fullText);
+        this.sendToWebview({ type: 'streamError', message: err.message, fullText, reasoningText });
       },
     });
   }
@@ -286,85 +307,95 @@ export class ChatPanel {
 
   /** 解析 LLM 输出中的 ```dispatch 指令块并自动执行派发 */
   private parseAndDispatch(llmOutput: string): void {
-    const blocks = this.extractDispatchBlocks(llmOutput);
-    if (blocks.length === 0) return;
-
-    for (const block of blocks) {
+    for (const block of this.extractDispatchBlocks(llmOutput)) {
       try {
-        const sessions = this.runtime.sessionManager.list(this.runtime.workspace.id);
-        const targetSession = sessions.find((s: any) =>
-          s.id.startsWith(block.target) || s.id === block.target
-        );
-        if (!targetSession) {
-          this.sendToWebview({ type: 'error', message: `派发失败：找不到目标会话 "${block.target}"` });
-          continue;
-        }
-        if (targetSession.id === this.session.id) {
-          this.sendToWebview({ type: 'error', message: '派发失败：不能向自己派发任务' });
-          continue;
-        }
-
-        const sourceRole = this.runtime.roleManager.get(this.session.roleId);
-        const targetRole = this.runtime.roleManager.get(targetSession.roleId);
-
-        const task = this.runtime.dispatcher.dispatch({
-          sourceSessionId: this.session.id,
-          targetSessionId: targetSession.id,
-          title: block.title,
-          brief: '',
-          contextPayload: {
-            sourceRole: { id: sourceRole!.id, name: sourceRole!.name, category: sourceRole!.category as string },
-            objective: block.objective,
-            acceptanceCriteria: [],
-            progressSummary: '',
-            relatedTasks: [],
-            relatedContracts: [],
-            relatedMemories: [],
-            conversationDigest: '',
-            expectedOutput: '',
-            constraints: [],
-          },
-          priority: 'medium',
-        });
-
-        // 通知源会话
-        const successMsg = `✅ 任务「${task.title}」已自动派发给 ${targetRole?.icon || '👤'} ${targetRole?.name || '未知角色'}（会话: "${targetSession.title}"）`;
-        this.runtime.sessionManager.addMessage(this.session.id, 'system', successMsg);
-        this.sendToWebview({ type: 'systemMessage', content: successMsg });
-
-        // 向目标会话注入任务通知
-        const sourceRoleName = sourceRole?.name || '未知角色';
-        const notifyMsg = [
-          `📋 **收到来自 ${sourceRole?.icon || '👤'} ${sourceRoleName} 的任务派发**`,
-          '',
-          `**任务标题**: ${task.title}`,
-          `**任务目标**: ${block.objective}`,
-          `**派发方**: ${sourceRole?.icon || '👤'} ${sourceRoleName}（会话: "${this.session.title}"）`,
-          `**优先级**: 中`,
-          '',
-          `请根据以上任务目标开始执行。完成后可以通过任务中心回复结果。`,
-        ].join('\n');
-
-        this.runtime.sessionManager.addMessage(targetSession.id, 'system', notifyMsg);
-
-        // 通知控制台刷新目标会话
-        const consoleProvider = this.ctx.getConsoleProvider();
-        if (consoleProvider) {
-          consoleProvider.postToWebview({ type: 'systemMessage', sessionId: targetSession.id, content: notifyMsg });
-        }
-
-        // 自动接受
-        try {
-          this.runtime.dispatcher.align(task.id);
-          this.runtime.dispatcher.accept(task.id);
-        } catch {
-          // 忽略状态错误
-        }
-
-      } catch (err: any) {
-        this.sendToWebview({ type: 'error', message: `派发失败: ${err.message}` });
+        this.dispatchSessionTask(block);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.sendToWebview({ type: 'error', message: `派发失败: ${message}` });
       }
     }
+  }
+
+  private async executeToolCall(call: LLMToolCall): Promise<string> {
+    if (call.name !== 'dispatch_session_task') return this.toolExecutor.execute(call);
+    let input: unknown;
+    try {
+      input = JSON.parse(call.arguments || '{}');
+    } catch {
+      throw new Error('工具参数不是有效的 JSON');
+    }
+    if (!input || typeof input !== 'object') throw new Error('工具参数必须是对象');
+    const values = input as Record<string, unknown>;
+    const block = {
+      target: typeof values.target === 'string' ? values.target.trim() : '',
+      title: typeof values.title === 'string' ? values.title.trim() : '',
+      objective: typeof values.objective === 'string' ? values.objective.trim() : '',
+    };
+    if (!block.target || !block.title || !block.objective) {
+      throw new Error('target、title 和 objective 均为必填字符串');
+    }
+    if (block.target.length > 128 || block.title.length > 200 || block.objective.length > 20000) {
+      throw new Error('工具参数超过允许长度');
+    }
+    return JSON.stringify({ ok: true, ...this.dispatchSessionTask(block) });
+  }
+
+  private dispatchSessionTask(block: { target: string; title: string; objective: string }): {
+    taskId: string;
+    targetSessionId: string;
+    targetSessionTitle: string;
+  } {
+    const sessions = this.runtime.sessionManager.list(this.runtime.workspace.id);
+    const matches = sessions.filter((candidate) => candidate.id === block.target || candidate.id.startsWith(block.target));
+    if (matches.length === 0) throw new Error(`找不到目标会话 "${block.target}"`);
+    if (matches.length > 1) throw new Error(`目标会话短 ID "${block.target}" 不唯一，请使用更长的 ID`);
+    const targetSession = matches[0];
+    if (targetSession.id === this.session.id) throw new Error('不能向自己派发任务');
+
+    const sourceRole = this.runtime.roleManager.get(this.session.roleId);
+    if (!sourceRole) throw new Error('当前会话角色不存在');
+    const targetRole = this.runtime.roleManager.get(targetSession.roleId);
+    const task = this.runtime.dispatcher.dispatch({
+      sourceSessionId: this.session.id,
+      targetSessionId: targetSession.id,
+      title: block.title,
+      brief: '',
+      contextPayload: {
+        sourceRole: { id: sourceRole.id, name: sourceRole.name, category: sourceRole.category as string },
+        objective: block.objective,
+        acceptanceCriteria: [],
+        progressSummary: '',
+        relatedTasks: [],
+        relatedContracts: [],
+        relatedMemories: [],
+        conversationDigest: '',
+        expectedOutput: '',
+        constraints: [],
+      },
+      priority: 'medium',
+    });
+
+    const successMsg = `任务「${task.title}」已自动派发给 ${targetRole?.name || '未知角色'}（会话: "${targetSession.title}"）`;
+    this.runtime.sessionManager.addMessage(this.session.id, 'system', successMsg);
+    this.sendToWebview({ type: 'systemMessage', content: successMsg });
+    const notifyMsg = [
+      `**收到来自 ${sourceRole.name} 的任务派发**`,
+      '',
+      `**任务标题**: ${task.title}`,
+      `**任务目标**: ${block.objective}`,
+      `**派发方**: ${sourceRole.name}（会话: "${this.session.title}"）`,
+      `**优先级**: 中`,
+      '',
+      '请根据以上任务目标开始执行。完成后可以通过任务中心回复结果。',
+    ].join('\n');
+    this.runtime.sessionManager.addMessage(targetSession.id, 'system', notifyMsg);
+    this.ctx.getConsoleProvider()?.postToWebview({ type: 'systemMessage', sessionId: targetSession.id, content: notifyMsg });
+    try {
+      this.runtime.dispatcher.align(task.id);
+      this.runtime.dispatcher.accept(task.id);
+    } catch {}
+    return { taskId: task.id, targetSessionId: targetSession.id, targetSessionTitle: targetSession.title };
   }
 
   private extractDispatchBlocks(text: string): Array<{ target: string; title: string; objective: string }> {
@@ -390,11 +421,12 @@ export class ChatPanel {
   }
 
   private handleAbort(): void {
+    this.toolExecutor.cancel();
     if (this.abortFn) {
       this.abortFn();
       this.abortFn = null;
       this.isStreaming = false;
-      this.sendToWebview({ type: 'streamEnd', fullText: '' });
+      this.sendToWebview({ type: 'streamEnd', fullText: '', aborted: true });
     }
   }
 
@@ -1461,6 +1493,9 @@ export class ChatPanel {
 
   let isStreaming = false;
   let currentAssistantEl = null;
+  let currentToolStatusEl = null;
+  const toolStatusElements = new Map();
+  let autoFollowOutput = true;
   let timerSeconds = 0;
   let timerInterval = null;
 
@@ -1479,6 +1514,18 @@ export class ChatPanel {
   function stopTimer() {
     if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
   }
+  function isNearBottom() {
+    return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight <= 48;
+  }
+  function scrollBottom(force) {
+    if (!force && !autoFollowOutput) return;
+    requestAnimationFrame(() => {
+      if (force || autoFollowOutput) messagesEl.scrollTop = messagesEl.scrollHeight;
+    });
+  }
+  messagesEl.addEventListener('scroll', () => {
+    autoFollowOutput = isNearBottom();
+  }, { passive: true });
   function formatTokens(value) {
     if (value >= 1000000) return (value / 1000000).toFixed(value >= 10000000 ? 0 : 1).replace(/\.0$/, '') + 'M';
     if (value >= 1000) return (value / 1000).toFixed(value >= 100000 ? 0 : 1).replace(/\.0$/, '') + 'K';
@@ -1620,7 +1667,7 @@ export class ChatPanel {
     wrapper.appendChild(bubble);
     messagesEl.appendChild(wrapper);
 
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    scrollBottom(false);
     return bubble;
   }
 
@@ -1702,6 +1749,7 @@ export class ChatPanel {
     const msg = e.data;
     switch (msg.type) {
       case 'historyLoaded': {
+        autoFollowOutput = true;
         window._currentRoleName = msg.role ? msg.role.name : 'AI';
         if (msg.modelName && modelNameEl) modelNameEl.textContent = msg.modelName;
         updateContextUsage(msg.contextUsage);
@@ -1723,25 +1771,32 @@ export class ChatPanel {
         } else {
           messagesEl.innerHTML = '<div class="empty-state"><div class="empty-icon">💬</div><div class="empty-text">开始与 AI 角色对话</div><div class="empty-hint">输入消息，按 Enter 发送 · Shift+Enter 换行</div></div>';
         }
+        scrollBottom(true);
         break;
       }
       case 'userMessage':
+        autoFollowOutput = true;
         appendMessage('user', msg.content, new Date().toISOString());
+        scrollBottom(true);
         break;
       case 'streamStart':
         setStreaming(true);
+        autoFollowOutput = true;
+        currentToolStatusEl = null;
+        toolStatusElements.clear();
         currentAssistantEl = appendMessage('assistant', '', new Date().toISOString());
         currentAssistantEl.classList.add('streaming-cursor');
         break;
       case 'reasoningChunk': {
         if (currentAssistantEl) {
           const reasoning = ensureReasoningPanel(currentAssistantEl);
+          const followReasoning = reasoning.scrollHeight - reasoning.scrollTop - reasoning.clientHeight <= 48;
           const raw = reasoning.getAttribute('data-raw') || '';
           const newText = raw + msg.delta;
           reasoning.setAttribute('data-raw', newText);
           reasoning.textContent = newText;
-          reasoning.scrollTop = reasoning.scrollHeight;
-          messagesEl.scrollTop = messagesEl.scrollHeight;
+          if (followReasoning) reasoning.scrollTop = reasoning.scrollHeight;
+          scrollBottom(false);
         }
         break;
       }
@@ -1751,8 +1806,21 @@ export class ChatPanel {
           const newText = raw + msg.delta;
           currentAssistantEl.setAttribute('data-raw', newText);
           currentAssistantEl.innerHTML = renderMarkdown(newText);
-          messagesEl.scrollTop = messagesEl.scrollHeight;
+          scrollBottom(false);
         }
+        break;
+      }
+      case 'toolStatus': {
+        const labels = { running: '正在调用工具', completed: '工具调用完成', failed: '工具调用失败' };
+        const toolKey = msg.callId || msg.name || '';
+        currentToolStatusEl = toolStatusElements.get(toolKey) || null;
+        if (!currentToolStatusEl) {
+          currentToolStatusEl = appendMessage('system', '', new Date().toISOString());
+          currentToolStatusEl.setAttribute('data-tool-key', toolKey);
+          toolStatusElements.set(toolKey, currentToolStatusEl);
+        }
+        currentToolStatusEl.textContent = (labels[msg.status] || '工具状态') + ': ' + (msg.name || 'unknown') + (msg.status === 'failed' && msg.detail ? ' - ' + msg.detail : '');
+        scrollBottom(false);
         break;
       }
       case 'streamEnd':
@@ -1768,10 +1836,29 @@ export class ChatPanel {
               reasoning.textContent = msg.reasoningText;
             }
           } else {
-            currentAssistantEl.textContent = '(已中断)';
+            currentAssistantEl.textContent = msg.aborted ? '(已中断)' : '(已完成，无文本回复)';
           }
           currentAssistantEl = null;
+          currentToolStatusEl = null;
+          toolStatusElements.clear();
         }
+        break;
+      case 'streamError':
+        setStreaming(false);
+        if (currentAssistantEl) {
+          currentAssistantEl.classList.remove('streaming-cursor');
+          currentAssistantEl.removeAttribute('data-raw');
+          currentAssistantEl.innerHTML = msg.fullText ? renderMarkdown(msg.fullText) : '(生成失败)';
+          if (msg.reasoningText) {
+            const reasoning = ensureReasoningPanel(currentAssistantEl);
+            reasoning.removeAttribute('data-raw');
+            reasoning.textContent = msg.reasoningText;
+          }
+          currentAssistantEl = null;
+          currentToolStatusEl = null;
+          toolStatusElements.clear();
+        }
+        appendMessage('system', '错误: ' + msg.message, new Date().toISOString());
         break;
       case 'contextInjected':
         appendMessage('system', msg.summary, new Date().toISOString());

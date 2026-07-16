@@ -47,10 +47,10 @@ npm run mcp
 
 **方式一：从 VSIX 安装（推荐）**
 
-1. 从 [GitHub Releases](https://github.com/Leesin596/ai-agent-coordinator/releases) 下载 `ai-agent-coordinator-0.1.0.vsix`
+1. 从 [GitHub Releases](https://github.com/Leesin596/ai-agent-coordinator/releases) 下载 `ai-agent-coordinator-0.1.1.vsix`
 2. 在 VS Code 中执行：
    ```
-   code --install-extension ai-agent-coordinator-0.1.0.vsix
+   code --install-extension ai-agent-coordinator-0.1.1.vsix
    ```
 3. 重载窗口（`Ctrl+Shift+P` → `Developer: Reload Window`）
 4. 左侧活动栏出现 Coordinator 图标，点击即可使用
@@ -64,7 +64,7 @@ npm run build
 # 打包 VSIX
 npx vsce package --no-git-tag-version
 # 安装
-code --install-extension ai-agent-coordinator-0.1.0.vsix
+code --install-extension ai-agent-coordinator-0.1.1.vsix
 ```
 
 ### 配置 LLM

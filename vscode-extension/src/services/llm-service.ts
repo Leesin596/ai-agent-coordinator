@@ -6,11 +6,25 @@
 import * as https from 'https';
 import * as http from 'http';
 import type { ModelApiFormat } from './model-store';
+import type { LLMToolDefinition } from './llm-api';
 import { extractApiError, parseStreamData, prepareLLMRequest } from './llm-api';
 
+export interface LLMToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+  legacy?: boolean;
+}
+
 export interface LLMMessage {
-  role: 'system' | 'user' | 'assistant';
+  role: 'system' | 'user' | 'assistant' | 'tool' | 'function';
   content: string;
+  toolCallId?: string;
+  toolCallName?: string;
+  toolCalls?: LLMToolCall[];
+  reasoningContent?: string;
+  reasoningSignature?: string;
+  providerItems?: Array<Record<string, unknown>>;
 }
 
 export interface LLMConfig {
@@ -22,6 +36,7 @@ export interface LLMConfig {
   maxTokens?: number;
   contextWindow?: number;
   thinkingStrength?: string;
+  tools?: LLMToolDefinition[];
 }
 
 export function estimateMessageTokens(messages: Array<{ content: string }>): number {
@@ -31,8 +46,10 @@ export function estimateMessageTokens(messages: Array<{ content: string }>): num
 export interface LLMStreamCallbacks {
   onChunk: (delta: string) => void;
   onReasoningChunk?: (delta: string) => void;
+  onToolCall?: (call: LLMToolCall) => Promise<string>;
+  onToolStatus?: (call: LLMToolCall, status: 'running' | 'completed' | 'failed', detail?: string) => void;
   onDone: (fullText: string, reasoningText: string) => void;
-  onError: (err: Error) => void;
+  onError: (err: Error, fullText: string, reasoningText: string) => void;
 }
 
 export class LLMService {
@@ -45,107 +62,198 @@ export class LLMService {
     config: LLMConfig,
     callbacks: LLMStreamCallbacks,
   ): () => void {
-    let prepared;
-    try {
-      prepared = prepareLLMRequest(messages, config, true);
-    } catch (err) {
-      callbacks.onError(err instanceof Error ? err : new Error(String(err)));
-      return () => undefined;
-    }
-    const { format, url, headers, body } = prepared;
-    const lib = url.protocol === 'https:' ? https : http;
-
-    const options: https.RequestOptions = {
-      hostname: url.hostname,
-      port: url.port || undefined,
-      path: url.pathname + url.search,
-      method: 'POST',
-      headers,
-    };
-
     let fullText = '';
     let reasoningText = '';
-    let buffer = '';
     let aborted = false;
     let settled = false;
+    let totalToolCalls = 0;
     let req: http.ClientRequest | null = null;
-
-    const finish = (): void => {
-      if (settled || aborted) return;
-      settled = true;
-      callbacks.onDone(fullText, reasoningText);
-    };
 
     const fail = (err: Error): void => {
       if (settled || aborted) return;
       settled = true;
-      callbacks.onError(err);
+      callbacks.onError(err, fullText, reasoningText);
     };
 
-    const processSSELine = (line: string): void => {
-      const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith('data:')) return;
-      const parsed = parseStreamData(format, trimmed.slice(5).trim());
-      if (parsed.error) {
-        fail(new Error(parsed.error));
-        req?.destroy();
+    const runRound = (roundMessages: LLMMessage[], round: number): void => {
+      if (aborted || settled) return;
+      let prepared;
+      try {
+        prepared = prepareLLMRequest(roundMessages, config, true);
+      } catch (err) {
+        fail(err instanceof Error ? err : new Error(String(err)));
         return;
       }
-      if (parsed.reasoningDelta) {
-        reasoningText += parsed.reasoningDelta;
-        callbacks.onReasoningChunk?.(parsed.reasoningDelta);
-      }
-      if (parsed.textDelta) {
-        fullText += parsed.textDelta;
-        callbacks.onChunk(parsed.textDelta);
-      }
-      if (parsed.done) finish();
-    };
+      const { format, url, headers, body } = prepared;
+      const lib = url.protocol === 'https:' ? https : http;
+      const options: https.RequestOptions = {
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: url.pathname + url.search,
+        method: 'POST',
+        headers,
+      };
+      let buffer = '';
+      let roundText = '';
+      let roundFinished = false;
+      let roundReasoning = '';
+      let reasoningSignature = '';
+      const providerItems: Array<Record<string, unknown>> = [];
+      const pendingCalls = new Map<number, LLMToolCall>();
 
-    req = lib.request(options, (res) => {
-      if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
-        let errBody = '';
-        res.on('data', (c) => (errBody += c.toString()));
-        res.on('end', () => {
-          fail(new Error(`LLM API 返回 ${res.statusCode}: ${extractApiError(errBody) || res.statusMessage}`));
-        });
-        return;
-      }
-
-      res.setEncoding('utf-8');
-      res.on('data', (chunk: string) => {
-        if (aborted) return;
-        buffer += chunk;
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || ''; // 保留不完整的最后一行
-
-        for (const line of lines) {
-          processSSELine(line);
-          if (settled) return;
+      const finishRound = async (): Promise<void> => {
+        if (roundFinished || aborted || settled) return;
+        roundFinished = true;
+        const allToolCalls = [...pendingCalls.entries()]
+          .sort(([left], [right]) => left - right)
+          .map(([, call]) => call);
+        const toolCalls = allToolCalls.filter((call) => call.name);
+        if (toolCalls.length !== allToolCalls.length) {
+          fail(new Error('模型返回了缺少工具名称的调用'));
+          return;
         }
+        if (new Set(toolCalls.map((call) => call.id)).size !== toolCalls.length) {
+          fail(new Error('模型返回了重复的工具调用 ID'));
+          return;
+        }
+        if (toolCalls.length === 0) {
+          settled = true;
+          callbacks.onDone(fullText, reasoningText);
+          return;
+        }
+        if (!callbacks.onToolCall) {
+          fail(new Error(`模型请求调用工具 ${toolCalls.map((call) => call.name).join(', ')}，但当前会话未提供工具执行器`));
+          return;
+        }
+        if (toolCalls.length > 8 || totalToolCalls + toolCalls.length > 16) {
+          fail(new Error('模型请求的工具调用数量超过安全上限'));
+          return;
+        }
+        totalToolCalls += toolCalls.length;
+        if (round >= 4) {
+          fail(new Error('模型连续工具调用超过 4 轮，已停止以避免循环'));
+          return;
+        }
+
+        const nextMessages: LLMMessage[] = [
+          ...roundMessages,
+          {
+            role: 'assistant',
+            content: roundText,
+            toolCalls,
+            reasoningContent: roundReasoning,
+            reasoningSignature,
+            providerItems,
+          },
+        ];
+        for (const call of toolCalls) {
+          if (aborted) return;
+          callbacks.onToolStatus?.(call, 'running');
+          try {
+            const result = await callbacks.onToolCall(call);
+            if (aborted) return;
+            callbacks.onToolStatus?.(call, 'completed', result);
+            nextMessages.push(call.legacy
+              ? { role: 'function', content: result, toolCallName: call.name }
+              : { role: 'tool', content: result, toolCallId: call.id });
+          } catch (err) {
+            if (aborted) return;
+            const message = err instanceof Error ? err.message : String(err);
+            callbacks.onToolStatus?.(call, 'failed', message);
+            nextMessages.push(call.legacy
+              ? {
+                  role: 'function',
+                  content: JSON.stringify({ ok: false, error: message }),
+                  toolCallName: call.name,
+                }
+              : {
+                  role: 'tool',
+                  content: JSON.stringify({ ok: false, error: message }),
+                  toolCallId: call.id,
+                });
+          }
+        }
+        runRound(nextMessages, round + 1);
+      };
+
+      const processSSELine = (line: string): void => {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data:')) return;
+        const parsed = parseStreamData(format, trimmed.slice(5).trim());
+        if (parsed.error) {
+          fail(new Error(parsed.error));
+          req?.destroy();
+          return;
+        }
+        if (parsed.reasoningDelta) {
+          roundReasoning += parsed.reasoningDelta;
+          reasoningText += parsed.reasoningDelta;
+          callbacks.onReasoningChunk?.(parsed.reasoningDelta);
+        }
+        if (parsed.reasoningSignatureDelta) reasoningSignature += parsed.reasoningSignatureDelta;
+        if (parsed.outputItem) providerItems.push(parsed.outputItem);
+        if (parsed.textDelta) {
+          roundText += parsed.textDelta;
+          fullText += parsed.textDelta;
+          callbacks.onChunk(parsed.textDelta);
+        }
+        for (const delta of parsed.toolCallDeltas || []) {
+          const current = pendingCalls.get(delta.index) || {
+            id: delta.id || `tool_call_${round}_${delta.index}`,
+            name: '',
+            arguments: '',
+            legacy: delta.legacy,
+          };
+          if (delta.id) current.id = delta.id;
+          if (delta.legacy) current.legacy = true;
+          if (delta.name && delta.name !== current.name) {
+            current.name += delta.name.startsWith(current.name) ? delta.name.slice(current.name.length) : delta.name;
+          }
+          if (delta.argumentsDelta) current.arguments += delta.argumentsDelta;
+          pendingCalls.set(delta.index, current);
+        }
+        if (parsed.done) void finishRound();
+      };
+
+      req = lib.request(options, (res) => {
+        if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
+          let errBody = '';
+          res.on('data', (chunk) => (errBody += chunk.toString()));
+          res.on('end', () => {
+            fail(new Error(`LLM API 返回 ${res.statusCode}: ${extractApiError(errBody) || res.statusMessage}`));
+          });
+          return;
+        }
+
+        res.setEncoding('utf-8');
+        res.on('data', (chunk: string) => {
+          if (aborted || settled || roundFinished) return;
+          buffer += chunk;
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) processSSELine(line);
+        });
+        res.on('end', () => {
+          if (aborted || settled || roundFinished) return;
+          if (buffer.trim()) processSSELine(buffer);
+          void finishRound();
+        });
+        res.on('error', (err) => fail(err));
       });
 
-      res.on('end', () => {
-        if (aborted) return;
-        // 处理 buffer 残留
-        if (buffer.trim()) processSSELine(buffer);
-        finish();
-      });
+      req.on('error', (err) => fail(err));
+      req.setTimeout(0);
+      req.setNoDelay(true);
+      req.write(body);
+      req.end();
+    };
 
-      res.on('error', (err) => fail(err));
-    });
-
-    req.on('error', (err) => fail(err));
-    req.setTimeout(0);
-    req.setNoDelay(true);
-
-    req.write(body);
-    req.end();
+    runRound(messages, 0);
 
     // 返回 abort 函数
     return () => {
       aborted = true;
-      if (req) req.destroy();
+      req?.destroy();
     };
   }
 

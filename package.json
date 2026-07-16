@@ -1,6 +1,6 @@
 {
   "name": "ai-agent-coordinator",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Lightweight local coordinator for multi-AI-agent collaboration",
   "main": "dist/index.js",
   "license": "MIT",
