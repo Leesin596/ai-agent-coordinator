@@ -4,17 +4,29 @@
 // 内含：多会话胶囊标签 + 消息流（流式 LLM）+ 输入区 + 工具栏
 // ============================================================
 import * as vscode from 'vscode';
+import * as path from 'path';
 import type { CoordinatorContext, ActiveWorkspaceRuntime } from '../backend/coordinator-context';
 import type { Role, Session } from '../../../src/models/types';
-import { LLMService, estimateMessageTokens, type LLMConfig, type LLMToolCall } from '../services/llm-service';
+import { LLMService, estimateMessageTokens, type LLMConfig, type LLMMessage, type LLMToolCall } from '../services/llm-service';
 import { COORDINATOR_LLM_TOOLS } from '../services/llm-api';
+import { filterToolsByRole, isToolAllowedByRole } from '../services/tool-filter';
+import { parseSlashCommand } from '../services/slash-commands';
+import type { MCPClientManager } from '../services/mcp-client';
 import { buildWorkspaceContext } from '../services/workspace-context';
 import { WorkspaceToolExecutor } from '../services/workspace-tools';
+import { CheckpointManager } from '../services/checkpoint-manager';
+import { TodoListManager } from '../services/todo-list-manager';
+import { EmbeddingService } from '../services/embedding-service';
+import { IndexingService } from '../services/indexing-service';
+import { shouldAutoApprove } from '../services/approval-helper';
+import { TerminalService } from '../services/terminal-service';
 import {
   buildSessionContextPackage,
   listContextSessionOptions,
   type ContextTransferMode,
 } from '../services/context-transfer';
+import { OrchestratorService } from '../../../src/core/orchestrator-service';
+import type { LLMCallFunction } from '../../../src/models/types';
 
 interface SessionTab {
   session: Session;
@@ -41,6 +53,14 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
   private pendingNewRoleEditor = false;
   private pendingDraftContexts: string[] = [];
   private webviewReady = false;
+  private mcpManager: MCPClientManager | null = null;
+  private terminalService = new TerminalService();
+  private todoListManager = new TodoListManager();
+  private embeddingService: EmbeddingService | null = null;
+  private indexingService: IndexingService | null = null;
+  private fileWatcherDisposable: vscode.Disposable | null = null;
+  private orchestrator = new OrchestratorService();
+  private pendingApprovals = new Map<string, { resolve: (v: boolean) => void; timeout: NodeJS.Timeout }>();
 
   private static readonly ROLE_CAT_LABELS: Record<string, string> = {
     engineering: '工程研发', product: '产品', design: '设计', qa: '质量保障', custom: '自定义',
@@ -48,6 +68,51 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
 
   constructor(ctx: CoordinatorContext) {
     this.ctx = ctx;
+    this.todoListManager.setChangeHandler((snapshot) => {
+      this.postToWebview({ type: 'todoUpdated', sessionId: snapshot.sessionId, items: snapshot.items });
+    });
+    this.embeddingService = new EmbeddingService(ctx.getModelStore());
+  }
+
+  /** 设置 MCP 客户端管理器，将其工具注入 LLM 调用 */
+  setMCPManager(manager: MCPClientManager): void {
+    this.mcpManager = manager;
+  }
+
+  /** 获取索引服务实例（供命令调用） */
+  getIndexingService(): IndexingService | null {
+    return this.indexingService;
+  }
+
+  /** 初始化语义索引服务（工作区切换时调用） */
+  private async initIndexingService(folderPath: string): Promise<void> {
+    // 清理旧实例
+    this.indexingService?.dispose();
+    this.indexingService = null;
+
+    const config = vscode.workspace.getConfiguration('coordinator.indexing');
+    const enabled = config.get<boolean>('enabled', true);
+    if (!enabled || !this.embeddingService) return;
+
+    // 刷新 embedding 配置（用户可能切换了模型预设）
+    this.embeddingService.refreshConfig();
+    if (!this.embeddingService.isConfigured()) return;
+
+    const schemaPath = path.join(this.ctx.getExtensionPath(), 'index-schema.sql');
+    this.indexingService = new IndexingService(folderPath, this.embeddingService, schemaPath);
+    await this.indexingService.ensureInitialized();
+
+    // 注册文件保存监听（增量索引）
+    this.fileWatcherDisposable?.dispose();
+    this.fileWatcherDisposable = vscode.workspace.onDidSaveTextDocument((doc) => {
+      if (doc.uri.scheme !== 'file' || !this.indexingService) return;
+      const wsFolder = vscode.workspace.getWorkspaceFolder(doc.uri);
+      if (!wsFolder || wsFolder.uri.fsPath !== folderPath) return;
+      const relativePath = vscode.workspace.asRelativePath(doc.uri, false).replace(/\\/g, '/');
+      this.indexingService.indexFile(relativePath).catch((err) => {
+        console.error('[Coordinator] 增量索引失败:', err);
+      });
+    });
   }
 
   /** 外部命令调用：聚焦面板并打开/切换到某会话 */
@@ -94,6 +159,13 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     }
     this.tabs.clear();
     this.currentSessionId = null;
+    // 重新初始化索引服务
+    const runtime = this.ctx.getActiveRuntime();
+    if (runtime) {
+      this.initIndexingService(runtime.workspace.folderPath).catch((err) => {
+        console.error('[Coordinator] 索引服务初始化失败:', err);
+      });
+    }
     await this.pushFullState();
     this.notifySessionsChanged();
   }
@@ -230,6 +302,28 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
           // 点击模型名标签 → 聚焦左侧「模型设置」view
           vscode.commands.executeCommand('coordinator.sidebar.focus');
           break;
+        case 'openToolPermissions': {
+          const tab = this.tabs.get(msg.sessionId || this.currentSessionId || '');
+          if (tab) {
+            this.postToWebview({
+              type: 'toolPermissionsData',
+              sessionId: tab.session.id,
+              roleId: tab.role.id,
+              roleName: tab.role.name,
+              allowedTools: tab.role.allowedTools || [],
+              deniedTools: tab.role.deniedTools || [],
+            });
+          }
+          break;
+        }
+        case 'updateToolPermissions': {
+          await this.handleUpdateToolPermissions(msg.sessionId, msg.allowedTools || [], msg.deniedTools || []);
+          break;
+        }
+        case 'toolApprovalResponse': {
+          this.handleToolApprovalResponse(msg.approvalId, msg.approved, msg.remember, msg.toolName);
+          break;
+        }
       }
     } catch (err: any) {
       this.postToWebview({ type: 'error', message: err.message });
@@ -312,6 +406,8 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       skillContent: role.skillContent || '',
       systemPrompt: role.systemPrompt || '',
       icon: role.icon || '👤',
+      allowedTools: Array.isArray(role.allowedTools) ? role.allowedTools : [],
+      deniedTools: Array.isArray(role.deniedTools) ? role.deniedTools : [],
     });
     this.pushRolesList();
     this.postToWebview({ type: 'roleSaved', roleId: createdRole.id });
@@ -330,6 +426,8 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     if (patch.skillContent !== undefined) updates.skillContent = String(patch.skillContent);
     if (patch.systemPrompt !== undefined) updates.systemPrompt = String(patch.systemPrompt);
     if (patch.icon !== undefined) updates.icon = String(patch.icon) || '👤';
+    if (patch.allowedTools !== undefined) updates.allowedTools = Array.isArray(patch.allowedTools) ? patch.allowedTools : [];
+    if (patch.deniedTools !== undefined) updates.deniedTools = Array.isArray(patch.deniedTools) ? patch.deniedTools : [];
     runtime.roleManager.update(id, updates);
     // 同步角色变更到已有会话的 system 消息
     const updatedRole = runtime.roleManager.get(id);
@@ -396,6 +494,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
   private disposeTab(sessionId: string): void {
     this.tabs.get(sessionId)?.toolExecutor.cancel();
     this.tabs.delete(sessionId);
+    this.todoListManager.dispose(sessionId);
     if (this.currentSessionId === sessionId) {
       this.currentSessionId = [...this.tabs.keys()][0] || null;
     }
@@ -405,6 +504,12 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
   // 业务逻辑
   // ============================================================
 
+  /** 外部调用：向当前活跃会话发送 Code Action 提示词 */
+  async handleCodeActionPrompt(prompt: string): Promise<void> {
+    if (!this.currentSessionId) return;
+    await this.handleSendMessage(this.currentSessionId, prompt);
+  }
+
   private async handleSendMessage(sessionId: string, content: string): Promise<void> {
     const runtime = this.ctx.getActiveRuntime();
     if (!runtime) return;
@@ -413,8 +518,14 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     const tab = this.tabs.get(sessionId);
     if (!tab || tab.streaming) return;
 
+    // Slash 命令解析
+    const { content: actualContent, modePrompt, mode } = parseSlashCommand(content);
+    if (!actualContent.trim()) return;
+
     const config = this.getLLMConfig(sessionId);
-    if (!config.apiKey) {
+    const isLocalProvider = /localhost|127\.0\.0\.1|0\.0\.0\.0/i.test(config.baseURL);
+    const apiKeyOptional = isLocalProvider || config.apiKeyRequired === false;
+    if (!config.apiKey && !apiKeyOptional) {
       this.postToWebview({ type: 'error', sessionId, message: '未配置模型 API Key，请在左侧「模型设置」中添加模型预设' });
       vscode.window.showWarningMessage('未配置模型 API Key', '去设置').then((choice) => {
         if (choice === '去设置') {
@@ -424,8 +535,11 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    runtime.sessionManager.addMessage(sessionId, 'user', content);
-    this.postToWebview({ type: 'userMessage', sessionId, content, createdAt: new Date().toISOString() });
+    runtime.sessionManager.addMessage(sessionId, 'user', actualContent);
+    this.postToWebview({ type: 'userMessage', sessionId, content: actualContent, createdAt: new Date().toISOString() });
+    if (mode) {
+      this.postToWebview({ type: 'modeIndicator', sessionId, mode });
+    }
 
     tab.streaming = true;
     tab.abortFn = null;
@@ -433,19 +547,33 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
 
     const messages = runtime.sessionManager.getConversationMessages(sessionId) as any[];
 
-    const workspaceContext = buildWorkspaceContext(this.ctx, runtime, sessionId, content);
+    const workspaceContext = buildWorkspaceContext(this.ctx, runtime, sessionId, actualContent);
     const systemIdx = messages.findIndex((m) => m.role === 'system');
     if (systemIdx >= 0) {
-      messages.splice(systemIdx + 1, 0, { role: 'system', content: workspaceContext });
+      const existing = messages[systemIdx];
+      messages[systemIdx] = { role: 'system', content: `${existing.content}\n\n${workspaceContext}` };
     } else {
       messages.unshift({ role: 'system', content: workspaceContext });
+    }
+    // 注入 slash 命令模式提示（合并到首条 system 消息，避免多条 system 被部分 provider 丢弃）
+    if (modePrompt) {
+      const idx = messages.findIndex((m) => m.role === 'system');
+      if (idx >= 0) {
+        messages[idx] = { role: 'system', content: `${messages[idx].content}\n\n${modePrompt}` };
+      } else {
+        messages.unshift({ role: 'system', content: modePrompt });
+      }
     }
 
     this.postContextUsage(sessionId, messages, config.contextWindow);
     tab.toolExecutor.begin();
 
     let usedNativeTool = false;
-    const abortFn = this.llm.streamChat(messages, { ...config, tools: COORDINATOR_LLM_TOOLS }, {
+    // 合并内置工具和 MCP 工具
+    const mcpTools = this.mcpManager?.getToolDefinitions() || [];
+    const roleFilteredTools = filterToolsByRole(COORDINATOR_LLM_TOOLS, tab.role);
+    const allTools = [...roleFilteredTools, ...mcpTools];
+    const abortFn = this.llm.streamChat(messages, { ...config, tools: allTools }, {
       onChunk: (delta) => {
         this.postToWebview({ type: 'streamChunk', sessionId, delta });
       },
@@ -454,6 +582,10 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       },
       onToolCall: (call) => {
         usedNativeTool = true;
+        // MCP 工具路由到 mcpManager 执行
+        if (this.mcpManager?.isMCPTool(call.name)) {
+          return this.mcpManager.executeTool(call);
+        }
         return this.executeToolCall(runtime, sessionId, call);
       },
       onToolStatus: (call, status, detail) => {
@@ -464,11 +596,8 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
         tab.streaming = false;
         tab.abortFn = null;
         this.postToWebview({ type: 'streamEnd', sessionId, fullText, reasoningText });
-        this.postContextUsage(
-          sessionId,
-          [...messages, { content: fullText }],
-          config.contextWindow,
-        );
+        // 从 DB 重新读取消息（包含刚写入的 assistant 回复），并重建 workspace context
+        this.postToWebview({ type: 'contextUsage', sessionId, ...this.getFullContextUsage(sessionId) });
         // 自动解析并执行派发指令
         if (!usedNativeTool) this.parseAndDispatch(runtime, sessionId, fullText);
       },
@@ -476,7 +605,8 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
         tab.streaming = false;
         tab.abortFn = null;
         if (fullText) runtime.sessionManager.addMessage(sessionId, 'assistant', fullText);
-        this.postToWebview({ type: 'streamError', sessionId, message: err.message, fullText, reasoningText });
+        const detail = `[${config.model}] ${err.message}`;
+        this.postToWebview({ type: 'streamError', sessionId, message: detail, fullText, reasoningText });
       },
     });
     tab.abortFn = abortFn;
@@ -545,10 +675,20 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     sourceSessionId: string,
     call: LLMToolCall,
   ): Promise<string> {
+    if (call.name === 'orchestrate_task') {
+      const tab = this.tabs.get(sourceSessionId);
+      if (tab && !isToolAllowedByRole(call.name, tab.role)) {
+        throw new Error(`角色「${tab.role.name}」无权使用工具: ${call.name}`);
+      }
+      return this.executeOrchestrateTask(runtime, sourceSessionId, call);
+    }
     if (call.name !== 'dispatch_session_task') {
-      const executor = this.tabs.get(sourceSessionId)?.toolExecutor;
-      if (!executor) throw new Error('当前会话工具执行器不可用');
-      return executor.execute(call);
+      const tab = this.tabs.get(sourceSessionId);
+      if (!tab) throw new Error('当前会话工具执行器不可用');
+      if (!isToolAllowedByRole(call.name, tab.role)) {
+        throw new Error(`角色「${tab.role.name}」无权使用工具: ${call.name}`);
+      }
+      return tab.toolExecutor.execute(call);
     }
     let input: unknown;
     try {
@@ -570,6 +710,77 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       throw new Error('工具参数超过允许长度');
     }
     return JSON.stringify({ ok: true, ...this.dispatchSessionTask(runtime, sourceSessionId, block) });
+  }
+
+  private async executeOrchestrateTask(
+    runtime: ActiveWorkspaceRuntime,
+    sourceSessionId: string,
+    call: LLMToolCall,
+  ): Promise<string> {
+    let input: unknown;
+    try {
+      input = JSON.parse(call.arguments || '{}');
+    } catch {
+      throw new Error('工具参数不是有效的 JSON');
+    }
+    if (!input || typeof input !== 'object') throw new Error('工具参数必须是对象');
+    const values = input as Record<string, unknown>;
+    const description = typeof values.description === 'string' ? values.description.trim() : '';
+    if (!description) throw new Error('description 为必填字符串');
+    if (description.length > 20000) throw new Error('description 超过允许长度');
+    const context = typeof values.context === 'string' ? values.context.trim().slice(0, 10000) : '';
+    const maxSubTasks = typeof values.maxSubTasks === 'number' && values.maxSubTasks >= 1 && values.maxSubTasks <= 10
+      ? Math.floor(values.maxSubTasks)
+      : 5;
+
+    this.orchestrator.setDB(runtime.db);
+    this.orchestrator.setEventBus(runtime.eventBus);
+    this.orchestrator.setDispatcher(runtime.dispatcher);
+    this.orchestrator.setSessionManager(runtime.sessionManager);
+    this.orchestrator.setRoleManager(runtime.roleManager);
+
+    const config = this.getLLMConfig(sourceSessionId);
+    const llmCall: LLMCallFunction = (messages, options) =>
+      this.llm.chat(messages as LLMMessage[], {
+        ...config,
+        temperature: options?.temperature ?? 0.3,
+        maxTokens: options?.maxTokens,
+        tools: undefined,
+      });
+
+    this.postToWebview({ type: 'systemMessage', sessionId: sourceSessionId, content: `🔄 开始自动编排任务: ${description.slice(0, 100)}...` });
+
+    try {
+      const result = await this.orchestrator.orchestrate(
+        {
+          description,
+          context,
+          sourceSessionId,
+          workspaceId: runtime.workspace.id,
+          maxSubTasks,
+        },
+        llmCall,
+      );
+
+      const summaryMsg = [
+        `## 编排结果: ${result.status === 'completed' ? '✅ 全部完成' : result.status === 'partial' ? '⚠️ 部分完成' : '❌ 失败'}`,
+        '',
+        result.summary,
+        '',
+        '### 子任务执行情况',
+        ...result.subTaskResults.map((r) =>
+          `- ${r.status === 'completed' ? '✅' : r.status === 'cancelled' ? '🚫' : '❌'} **${r.title}** → ${r.targetRole}: ${r.result.slice(0, 200)}`,
+        ),
+      ].join('\n');
+      runtime.sessionManager.addMessage(sourceSessionId, 'system', summaryMsg);
+      this.postToWebview({ type: 'systemMessage', sessionId: sourceSessionId, content: summaryMsg });
+
+      return JSON.stringify({ ok: true, result });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.postToWebview({ type: 'error', sessionId: sourceSessionId, message: `编排失败: ${message}` });
+      throw new Error(`编排失败: ${message}`);
+    }
   }
 
   private dispatchSessionTask(
@@ -802,6 +1013,38 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     this.notifySessionsChanged();
   }
 
+  private async handleUpdateToolPermissions(sessionId: string, allowedTools: string[], deniedTools: string[]): Promise<void> {
+    const runtime = this.ctx.getActiveRuntime();
+    if (!runtime) return;
+    const tab = this.tabs.get(sessionId || '');
+    if (!tab) return;
+    runtime.roleManager.update(tab.role.id, { allowedTools, deniedTools });
+    // 立即刷新当前 tab 的 role 引用
+    const updatedRole = runtime.roleManager.get(tab.role.id);
+    if (updatedRole) {
+      tab.role = updatedRole;
+      tab.toolExecutor.setRole(updatedRole);
+      runtime.sessionManager.syncRoleToSessions(updatedRole, runtime.workspace.id);
+    }
+    this.postToWebview({ type: 'toolPermissionsSaved', sessionId });
+  }
+
+  private handleToolApprovalResponse(approvalId: string, approved: boolean, remember: boolean, toolName?: string): void {
+    const pending = this.pendingApprovals.get(approvalId);
+    if (!pending) return;
+    clearTimeout(pending.timeout);
+    this.pendingApprovals.delete(approvalId);
+    pending.resolve(approved);
+    if (remember && approved && toolName) {
+      const config = vscode.workspace.getConfiguration('coordinator.autoApprove');
+      const tools = config.get<string[]>('tools', []);
+      if (!tools.includes(toolName)) {
+        tools.push(toolName);
+        config.update('tools', tools, vscode.ConfigurationTarget.Workspace);
+      }
+    }
+  }
+
   // ============================================================
   // 状态推送
   // ============================================================
@@ -845,7 +1088,45 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       currentSessionId: this.currentSessionId,
     });
 
+    this.pushWorkspaceFiles(runtime.workspace.folderPath);
+
     await this.pushCurrentMessages();
+  }
+
+  private workspaceFilesCache: { name: string; relPath: string }[] = [];
+  private pushWorkspaceFiles(folderPath: string): void {
+    try {
+      const fs = require('fs') as typeof import('fs');
+      const path = require('path') as typeof import('path');
+      const excludeDirs = new Set(['node_modules', '.git', 'dist', 'out', '.coordinator', '.vscode', 'build']);
+      const excludeExts = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg', '.woff', '.woff2', '.ttf', '.eot', '.mp4', '.mp3', '.zip', '.tar', '.gz', '.lock']);
+      const files: { name: string; relPath: string }[] = [];
+      const walk = (dir: string, depth: number) => {
+        if (depth > 4 || files.length > 500) return;
+        let entries: string[];
+        try { entries = fs.readdirSync(dir); } catch { return; }
+        for (const entry of entries) {
+          if (entry.startsWith('.') && entry !== '.github') continue;
+          const full = path.join(dir, entry);
+          let stat;
+          try { stat = fs.statSync(full); } catch { continue; }
+          if (stat.isDirectory()) {
+            if (excludeDirs.has(entry)) continue;
+            walk(full, depth + 1);
+          } else {
+            const ext = path.extname(entry).toLowerCase();
+            if (excludeExts.has(ext)) continue;
+            const relPath = path.relative(folderPath, full).replace(/\\/g, '/');
+            files.push({ name: entry, relPath });
+          }
+        }
+      };
+      walk(folderPath, 0);
+      this.workspaceFilesCache = files;
+      this.postToWebview({ type: 'workspaceFiles', files });
+    } catch {
+      // ignore
+    }
   }
 
   private async pushCurrentMessages(): Promise<void> {
@@ -869,15 +1150,17 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       models,
       defaultModelId,
       currentModelId,
-      contextUsage: this.getContextUsage(
-        runtime.sessionManager.getConversationMessages(this.currentSessionId) as any[],
-        config.contextWindow,
-      ),
+      contextUsage: this.getFullContextUsage(this.currentSessionId),
       messages: messages.map((m) => ({
         role: m.role,
         content: m.content,
         createdAt: m.createdAt,
       })),
+    });
+    this.postToWebview({
+      type: 'todoUpdated',
+      sessionId: this.currentSessionId,
+      items: this.todoListManager.getTodos(this.currentSessionId),
     });
   }
 
@@ -900,14 +1183,34 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
             streaming: false,
             abortFn: null,
             toolExecutor: new WorkspaceToolExecutor(runtime.workspace.folderPath, async (request) => {
-              const choice = await vscode.window.showWarningMessage(
-                request.title,
-                { modal: true, detail: request.detail },
-                request.confirmLabel,
-              );
-              return choice === request.confirmLabel;
+              if (request.toolName && shouldAutoApprove(request.toolName)) return true;
+              if (request.toolName && role.allowedTools?.includes(request.toolName)) return true;
+              // Webview 内审批弹窗
+              const approvalId = `approval_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+              this.postToWebview({
+                type: 'toolApprovalRequest',
+                sessionId: t.id,
+                approvalId,
+                title: request.title,
+                detail: request.detail,
+                confirmLabel: request.confirmLabel,
+                toolName: request.toolName || '',
+              });
+              return new Promise<boolean>((resolve) => {
+                const timeout = setTimeout(() => {
+                  this.pendingApprovals.delete(approvalId);
+                  resolve(false);
+                }, 300000);
+                this.pendingApprovals.set(approvalId, { resolve, timeout });
+              });
             }),
           });
+          this.tabs.get(t.id)!.toolExecutor.setRole(role);
+          this.tabs.get(t.id)!.toolExecutor.setCheckpointManager(new CheckpointManager(runtime.workspace.folderPath));
+          this.tabs.get(t.id)!.toolExecutor.setTerminalRunner(this.terminalService.createRunner());
+          this.tabs.get(t.id)!.toolExecutor.setTodoListManager(this.todoListManager);
+          this.tabs.get(t.id)!.toolExecutor.setIndexingService(this.indexingService);
+          this.tabs.get(t.id)!.toolExecutor.setSessionId(t.id);
         }
       }
     }
@@ -933,6 +1236,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
             temperature: preset.temperature ?? 0.7,
             contextWindow: preset.contextWindow ?? 1000000,
             thinkingStrength: preset.thinkingStrength ?? 'xhigh',
+            apiKeyRequired: preset.apiKeyRequired,
           };
         }
       }
@@ -948,6 +1252,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
         temperature: def.temperature ?? 0.7,
         contextWindow: def.contextWindow ?? 1000000,
         thinkingStrength: def.thinkingStrength ?? 'xhigh',
+        apiKeyRequired: def.apiKeyRequired,
       };
     }
     // 3. 兜底：全局 configuration（兼容极旧配置）
@@ -967,6 +1272,28 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     const limit = Math.max(1, contextWindow);
     const used = estimateMessageTokens(messages);
     return { used, limit, percent: Math.min(100, Math.round((used / limit) * 100)) };
+  }
+
+  /**
+   * 计算包含工作区上下文的真实上下文占用。
+   * 使用最后一条 user 消息作为 query 来构建 workspace context，
+   * 保证和 handleSendMessage 中发给 LLM 的消息序列一致。
+   */
+  private getFullContextUsage(sessionId: string): { used: number; limit: number; percent: number } {
+    const runtime = this.ctx.getActiveRuntime();
+    if (!runtime) return { used: 0, limit: 1, percent: 0 };
+    const config = this.getLLMConfig(sessionId);
+    const messages = runtime.sessionManager.getConversationMessages(sessionId) as any[];
+    const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+    const query = lastUser?.content || '';
+    const workspaceContext = buildWorkspaceContext(this.ctx, runtime, sessionId, query);
+    const systemIdx = messages.findIndex((m) => m.role === 'system');
+    if (systemIdx >= 0) {
+      messages[systemIdx] = { role: 'system', content: `${messages[systemIdx].content}\n\n${workspaceContext}` };
+    } else {
+      messages.unshift({ role: 'system', content: workspaceContext });
+    }
+    return this.getContextUsage(messages, config.contextWindow);
   }
 
   private postContextUsage(sessionId: string, messages: Array<{ content: string }>, contextWindow = 1000000): void {
@@ -992,15 +1319,10 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
   /** 模型库 / 会话模型绑定变化时刷新当前模型名显示 */
   refreshModels(): void {
     const modelName = this.getCurrentModelName(this.currentSessionId);
-    const runtime = this.ctx.getActiveRuntime();
-    const messages = runtime && this.currentSessionId
-      ? runtime.sessionManager.getConversationMessages(this.currentSessionId) as any[]
-      : [];
-    const contextWindow = this.getLLMConfig(this.currentSessionId || undefined).contextWindow;
     this.postToWebview({
       type: 'modelName',
       modelName,
-      contextUsage: this.getContextUsage(messages, contextWindow),
+      contextUsage: this.currentSessionId ? this.getFullContextUsage(this.currentSessionId) : undefined,
     });
   }
 
@@ -1159,9 +1481,23 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     border:1px solid rgba(220,200,120,.2);
     font-size:12px; padding:7px 12px; border-radius: var(--r-md);
   }
-  .reasoning-panel { margin:0 0 6px; border:1px solid var(--border-subtle); border-radius:var(--r-md); background:rgba(255,255,255,.025); color:var(--text2); max-width:720px; }
-  .reasoning-panel summary { cursor:pointer; padding:6px 9px; font-size:11px; color:var(--text3); user-select:none; }
+  .reasoning-panel { margin:0 0 6px; border:1px solid var(--border-subtle); border-radius:var(--r-md); background:rgba(255,255,255,.025); color:var(--text2); max-width:720px; transition:border-color .3s; }
+  .reasoning-panel.is-streaming { border-color: rgba(100,160,255,.35); }
+  .reasoning-panel.is-streaming summary { color:#6ba3ff; }
+  .reasoning-panel summary { cursor:pointer; padding:6px 9px; font-size:11px; color:var(--text3); user-select:none; display:flex; align-items:center; gap:5px; }
+  .reasoning-panel.is-streaming summary::before { content:''; width:6px; height:6px; border-radius:50%; background:#6ba3ff; animation:pulseDot 1s ease-in-out infinite; }
+  @keyframes pulseDot { 0%,100%{opacity:.3} 50%{opacity:1} }
   .reasoning-content { padding:0 9px 8px; white-space:pre-wrap; word-break:break-word; font-size:11px; line-height:1.55; max-height:260px; overflow:auto; }
+  .reasoning-content.is-streaming::after { content:'▊'; animation:blinkCursor .8s step-end infinite; color:#6ba3ff; font-size:10px; }
+  .tool-badges { margin:0 0 5px; display:flex; flex-direction:column; gap:3px; max-width:720px; }
+  .tool-badge { display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:10px; font-size:11px; line-height:1.4; border:1px solid var(--border-subtle); background:rgba(255,255,255,.03); color:var(--text2); max-width:fit-content; transition:all .25s; }
+  .tool-badge.running { border-color:rgba(100,160,255,.3); color:#6ba3ff; }
+  .tool-badge.running::before { content:''; width:8px; height:8px; border:1.5px solid #6ba3ff; border-top-color:transparent; border-radius:50%; animation:spinBadge .6s linear infinite; flex-shrink:0; }
+  .tool-badge.completed { border-color:rgba(80,200,120,.25); color:#5ac878; }
+  .tool-badge.completed::before { content:'✓'; font-size:10px; font-weight:700; }
+  .tool-badge.failed { border-color:rgba(240,100,100,.3); color:#f06464; }
+  .tool-badge.failed::before { content:'✕'; font-size:10px; font-weight:700; }
+  @keyframes spinBadge { to{transform:rotate(360deg)} }
   .msg-meta { font-size:10px; color: var(--text3); margin-bottom:2px; }
   .msg-row.user .msg-meta { text-align:right; }
 
@@ -1198,6 +1534,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     background: var(--bg-elevated);
     border-top:1px solid var(--border-subtle);
     flex-shrink:0;
+    position:relative;
   }
   .toolbar {
     display:flex; align-items:center; gap:2px; margin-bottom:6px;
@@ -1283,6 +1620,24 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     outline:none; padding:0 2px;
   }
   .input-box textarea::placeholder { color: var(--text3); }
+  .cmd-hint {
+    position:absolute; bottom:52px; left:12px; right:12px;
+    max-height:240px; overflow-y:auto;
+    background:var(--bg-elevated); border:1px solid var(--border);
+    border-radius:var(--r-md); box-shadow:0 -4px 16px rgba(0,0,0,.25);
+    z-index:200;
+  }
+  .cmd-hint-item {
+    display:flex; align-items:center; gap:10px; padding:8px 12px; cursor:pointer;
+    border-bottom:1px solid var(--border-subtle); font-size:12px;
+  }
+  .cmd-hint-item:last-child { border-bottom:none; }
+  .cmd-hint-item:hover, .cmd-hint-item.active { background:var(--bg-hover); }
+  .cmd-hint-cmd { font-weight:600; color:var(--accent); min-width:80px; }
+  .cmd-hint-label { color:var(--text2); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .cmd-hint-file-icon { color:var(--text3); font-size:14px; flex-shrink:0; }
+  .cmd-hint-file-path { color:var(--text); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:var(--vscode-editor-font-family, monospace); font-size:11px; }
+  .cmd-hint-file-name { color:var(--accent); font-weight:600; }
   .send-btn {
     display:inline-flex; align-items:center; justify-content:center;
     width:30px; height:30px; border:none; border-radius:50%;
@@ -1450,6 +1805,20 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
   .re-form .re-prompt { min-height:190px; font-family:var(--vscode-editor-font-family, monospace); }
   .re-form select { padding:7px 9px; border-radius:6px; border:1px solid var(--border); background:var(--bg-input); color:var(--text); font-size:12px; font-family:inherit; outline:none; }
   .re-help { color:var(--text3); font-size:9.5px; margin-top:4px; }
+  .tool-perm-grid { display:flex; flex-direction:column; gap:8px; }
+  .tool-perm-group { display:flex; flex-direction:column; gap:4px; }
+  .tool-perm-group-label { font-size:10px; font-weight:600; color:var(--text2); text-transform:uppercase; letter-spacing:.4px; }
+  .tool-perm-row { display:flex; align-items:center; gap:6px; padding:4px 8px; border-radius:5px; background:var(--bg-input); }
+  .tool-perm-name { flex:1; font-size:11px; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tool-perm-toggle { display:flex; gap:2px; flex-shrink:0; }
+  .tool-perm-btn {
+    padding:2px 8px; border:1px solid var(--border); border-radius:10px;
+    font-size:9.5px; cursor:pointer; background:transparent; color:var(--text3);
+    transition:all var(--transition); user-select:none;
+  }
+  .tool-perm-btn:hover { border-color:var(--text3); }
+  .tool-perm-btn.active.allow { background:var(--accent); color:var(--user-text); border-color:var(--accent); }
+  .tool-perm-btn.active.deny { background:var(--danger); color:#fff; border-color:var(--danger); }
   .re-form-actions {
     position:sticky; bottom:0; display:flex; align-items:center; gap:8px; justify-content:flex-end;
     padding:10px 14px; border-top:1px solid var(--border-subtle); background:var(--bg-elevated);
@@ -1459,6 +1828,55 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     .role-editor-left { width:176px; }
     .re-form-row, .re-form-row.equal { grid-template-columns:1fr; }
   }
+
+  /* ─── Todo List 面板 ─── */
+  .todo-panel {
+    flex-shrink:0; max-height:220px; overflow-y:auto;
+    background:var(--bg-elevated); border-bottom:1px solid var(--border-subtle);
+    padding:8px 12px; display:none; flex-direction:column; gap:4px;
+  }
+  .todo-panel.show { display:flex; }
+  .todo-panel::-webkit-scrollbar { width:5px; }
+  .todo-panel::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+  .todo-header {
+    display:flex; align-items:center; gap:6px; font-size:11px; color:var(--text2);
+    margin-bottom:2px; user-select:none;
+  }
+  .todo-header .todo-progress {
+    margin-left:auto; font-size:10px; color:var(--text3); font-variant-numeric:tabular-nums;
+  }
+  .todo-item {
+    display:flex; align-items:center; gap:7px; padding:4px 8px;
+    border-radius:var(--r-sm); background:var(--bg-card); font-size:12px;
+    transition:background var(--transition);
+  }
+  .todo-item:hover { background:var(--bg-hover); }
+  .todo-icon {
+    width:16px; height:16px; border-radius:50%; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center;
+    font-size:10px; border:1.5px solid var(--border);
+  }
+  .todo-item.pending .todo-icon { border-color:var(--text3); }
+  .todo-item.in_progress .todo-icon {
+    border-color:#6ba3ff; border-top-color:transparent;
+    animation:spinBadge .8s linear infinite;
+  }
+  .todo-item.completed .todo-icon {
+    background:var(--success); border-color:var(--success); color:#1e1e1e;
+  }
+  .todo-item.completed .todo-icon::before { content:'✓'; font-weight:700; }
+  .todo-item.failed .todo-icon {
+    background:var(--danger); border-color:var(--danger); color:#fff;
+  }
+  .todo-item.failed .todo-icon::before { content:'✕'; font-weight:700; }
+  .todo-content { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text); }
+  .todo-item.completed .todo-content { color:var(--text3); text-decoration:line-through; }
+  .todo-priority {
+    font-size:9px; padding:1px 5px; border-radius:8px; flex-shrink:0;
+  }
+  .todo-priority.high { background:rgba(240,100,100,.15); color:#f06464; }
+  .todo-priority.medium { background:rgba(100,160,255,.12); color:#6ba3ff; }
+  .todo-priority.low { background:rgba(255,255,255,.06); color:var(--text3); }
 </style>
 </head>
 <body>
@@ -1475,6 +1893,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
   <span id="wsName"></span>
 </div>
 
+<div class="todo-panel" id="todoPanel"></div>
 <div class="messages" id="messages"></div>
 
   <div class="input-area" id="inputArea" style="display:none">
@@ -1482,6 +1901,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     <button class="tool-btn" id="btnAttachContext" title="添加上下文">＋<span class="tip">添加上下文</span></button>
     <button class="tool-btn" id="btnContext" title="会话接力与上下文对齐">⇄<span class="tip">上下文对齐</span></button>
     <button class="tool-btn" id="btnClear">🗑️<span class="tip">清空对话</span></button>
+    <button class="tool-btn" id="btnToolPerm" title="工具权限">🛠️<span class="tip">工具权限</span></button>
     <div class="tool-spacer"></div>
     <div style="position:relative; display:inline-flex; align-items:center;">
       <button class="tool-btn" id="btnModel" title="点击切换模型">🤖<span class="model-name" id="modelName">未配置模型</span><span class="tip">切换模型</span></button>
@@ -1492,7 +1912,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
   </div>
   <div class="draft-contexts" id="draftContexts"></div>
   <div class="input-box">
-    <textarea id="input" placeholder="输入消息，Enter 发送 · Shift+Enter 换行" rows="1"></textarea>
+    <textarea id="input" placeholder="输入消息 · / 模式 · @ 文件" rows="1"></textarea>
     <button class="send-btn" id="btnSend" title="发送 (Enter)">➤</button>
   </div>
 </div>
@@ -1526,6 +1946,46 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
   </div>
 </div>
 
+<!-- 工具权限弹窗 -->
+<div class="modal-overlay" id="toolPermModal" style="display:none">
+  <div class="settings-modal" style="width:480px;">
+    <div class="modal-header">
+      <h3>🛠️ 工具权限 — <span id="toolPermRoleName"></span></h3>
+      <button class="modal-close-btn" id="toolPermClose" title="关闭">×</button>
+    </div>
+    <div class="modal-body" style="padding:14px 18px;">
+      <div class="re-help" style="margin-bottom:8px;">允许 = 白名单模式（仅启用选中工具，留空=继承全部）；禁止 = 黑名单（优先排除）。</div>
+      <div id="toolPermGrid"></div>
+    </div>
+    <div class="modal-footer">
+      <span class="config-status" id="toolPermStatus"></span>
+      <button class="btn-modal btn-modal-primary" id="toolPermSave">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 工具审批弹窗 -->
+<div class="modal-overlay" id="approvalModal" style="display:none">
+  <div class="settings-modal" style="width:520px;">
+    <div class="modal-header">
+      <h3 id="approvalTitle">⚠️ 工具审批</h3>
+      <button class="modal-close-btn" id="approvalDeny" title="拒绝">×</button>
+    </div>
+    <div class="modal-body" style="padding:14px 18px;">
+      <pre id="approvalDetail" style="white-space:pre-wrap;font-size:12px;line-height:1.6;color:var(--text2);font-family:var(--vscode-editor-font-family,monospace);max-height:300px;overflow-y:auto;"></pre>
+    </div>
+    <div class="modal-footer">
+      <span class="config-status" id="approvalStatus" style="flex:1;">
+        <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer;">
+          <input type="checkbox" id="approvalRemember" style="margin:0;"> 记住选择（后续自动批准此工具）
+        </label>
+      </span>
+      <button class="btn-modal" id="approvalDenyBtn">拒绝</button>
+      <button class="btn-modal btn-modal-primary" id="approvalApprove">允许</button>
+    </div>
+  </div>
+</div>
+
 <script>
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
@@ -1537,6 +1997,14 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
   const inputArea = $('inputArea');
   const emptyEl = $('empty');
   const wsBar = $('wsBar');
+  const todoPanelEl = $('todoPanel');
+  const cmdHintEl = document.createElement('div');
+  cmdHintEl.className = 'cmd-hint';
+  cmdHintEl.style.display = 'none';
+  inputArea.appendChild(cmdHintEl);
+  let cmdHintMode = null; // 'slash' | 'file' | null
+  let cmdHintItems = [];
+  let cmdHintActiveIdx = 0;
 
   let curSession = null;
   let isStreaming = false;
@@ -1661,18 +2129,55 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     scrollBottom(true);
   }
 
+  // ─── Todo List 渲染 ───
+  const todoIcons = { pending: '○', in_progress: '◐', completed: '✓', failed: '✕' };
+  function renderTodoPanel(sessionId, items) {
+    if (sessionId !== curSession) return;
+    if (!items || items.length === 0) {
+      todoPanelEl.classList.remove('show');
+      todoPanelEl.innerHTML = '';
+      return;
+    }
+    const completed = items.filter(i => i.status === 'completed').length;
+    const failed = items.filter(i => i.status === 'failed').length;
+    const total = items.length;
+    const progress = completed + (failed ? '/' + failed : '') + ' / ' + total;
+    let html = '<div class="todo-header"><span>📋 任务清单</span><span class="todo-progress">' + progress + '</span></div>';
+    html += items.map(function(item) {
+      return '<div class="todo-item ' + item.status + '">' +
+        '<span class="todo-icon"></span>' +
+        '<span class="todo-content" title="' + esc(item.content) + '">' + esc(item.content) + '</span>' +
+        '<span class="todo-priority ' + item.priority + '">' + item.priority + '</span>' +
+      '</div>';
+    }).join('');
+    todoPanelEl.innerHTML = html;
+    todoPanelEl.classList.add('show');
+  }
+
   function ensureReasoningPanel(bubble) {
     if (!bubble) return null;
     const container = bubble.parentElement;
     let panel = container.querySelector('.reasoning-panel');
     if (!panel) {
       panel = document.createElement('details');
-      panel.className = 'reasoning-panel';
+      panel.className = 'reasoning-panel is-streaming';
       panel.open = true;
-      panel.innerHTML = '<summary>思考过程</summary><div class="reasoning-content"></div>';
+      panel.innerHTML = '<summary>思考中...</summary><div class="reasoning-content is-streaming"></div>';
       container.insertBefore(panel, bubble);
     }
-    return panel.querySelector('.reasoning-content');
+    return panel;
+  }
+
+  function ensureToolBadges(bubble) {
+    if (!bubble) return null;
+    const container = bubble.parentElement;
+    let el = container.querySelector('.tool-badges');
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'tool-badges';
+      container.insertBefore(el, bubble);
+    }
+    return el;
   }
 
   function appendMessage(role, content, createdAt, sessionId) {
@@ -1927,11 +2432,47 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       {value:'custom', label:'自定义'},
     ];
     const isNew = !role;
-    const r = role || { name:'', icon:'👤', category:'custom', description:'', skillSlug:'', skills:[], skillContent:'', systemPrompt:'', builtIn:false };
+    const r = role || { name:'', icon:'👤', category:'custom', description:'', skillSlug:'', skills:[], skillContent:'', systemPrompt:'', builtIn:false, allowedTools:[], deniedTools:[] };
     const skillsStr = Array.isArray(r.skills) ? r.skills.join('\\n') : '';
     const catOpts = CATS.map(c =>
       '<option value="' + c.value + '"' + (c.value === r.category ? ' selected' : '') + '>' + esc(c.label) + '</option>'
     ).join('');
+
+    const ALL_TOOLS = [
+      {name:'workspace_list_files', label:'列出文件', group:'读取'},
+      {name:'workspace_read_file', label:'读取文件', group:'读取'},
+      {name:'workspace_search', label:'搜索内容', group:'读取'},
+      {name:'git_status', label:'Git 状态', group:'读取'},
+      {name:'git_diff', label:'Git Diff', group:'读取'},
+      {name:'workspace_write_file', label:'写入文件', group:'编辑'},
+      {name:'workspace_replace', label:'替换内容', group:'编辑'},
+      {name:'workspace_apply_diff', label:'Diff 补丁', group:'编辑'},
+      {name:'workspace_search_replace', label:'搜索替换', group:'编辑'},
+      {name:'workspace_delete', label:'删除文件', group:'编辑'},
+      {name:'run_command', label:'执行命令', group:'命令'},
+      {name:'dispatch_session_task', label:'派发任务', group:'编排'},
+      {name:'todo_list_create', label:'创建清单', group:'任务'},
+      {name:'todo_list_update', label:'更新清单', group:'任务'},
+      {name:'todo_list_read', label:'读取清单', group:'任务'},
+    ];
+    const allowedSet = new Set(r.allowedTools || []);
+    const deniedSet = new Set(r.deniedTools || []);
+    const groups = {};
+    ALL_TOOLS.forEach(t => { (groups[t.group] = groups[t.group] || []).push(t); });
+    const toolCheckboxes = Object.entries(groups).map(([groupLabel, tools]) => {
+      const rows = tools.map(t => {
+        const isAllowed = allowedSet.has(t.name);
+        const isDenied = deniedSet.has(t.name);
+        return '<div class="tool-perm-row">' +
+          '<span class="tool-perm-name" title="' + esc(t.name) + '">' + esc(t.label) + '</span>' +
+          '<div class="tool-perm-toggle">' +
+            '<span class="tool-perm-btn allow' + (isAllowed ? ' active' : '') + '" data-allow="' + esc(t.name) + '">允许</span>' +
+            '<span class="tool-perm-btn deny' + (isDenied ? ' active' : '') + '" data-deny="' + esc(t.name) + '">禁止</span>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+      return '<div class="tool-perm-group"><div class="tool-perm-group-label">' + esc(groupLabel) + '</div>' + rows + '</div>';
+    }).join('');
 
     roleEditorRight.innerHTML =
       '<div class="re-form">' +
@@ -1949,6 +2490,10 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
           '<div class="setting-group"><div class="setting-label">能力目录</div><textarea id="rfSkills" placeholder="每行一个能力，例如：\\nTypeScript\\n组件设计\\n可访问性">' + esc(skillsStr) + '</textarea><div class="re-help">用于概览和检索，不承担具体执行方法。</div></div>' +
           '<div class="setting-group"><div class="setting-label">Skill 工作手册</div><textarea class="re-prompt" id="rfSkillContent" placeholder="# 工作手册\\n\\n## 适用场景\\n...\\n\\n## 执行流程\\n1. ...\\n\\n## 完成标准\\n...">' + esc(r.skillContent) + '</textarea><div class="re-help">Markdown 操作手册会在每次请求中强制激活，应写清适用场景、执行步骤、检查项和完成标准。</div></div>' +
           '<div class="setting-group"><div class="setting-label">角色提示词</div><textarea class="re-prompt" id="rfPrompt" placeholder="只定义角色身份、职责和沟通方式">' + esc(r.systemPrompt) + '</textarea><div class="re-help">角色提示词回答“是谁”；Skill 工作手册回答“如何做”。</div></div>' +
+          '<div class="setting-group"><div class="setting-label">工具权限</div>' +
+            '<div class="re-help" style="margin-bottom:6px;">勾选允许仅启用选定工具（白名单模式，留空=继承全部）；勾选禁止排除工具（黑名单优先）。</div>' +
+            '<div class="tool-perm-grid">' + toolCheckboxes + '</div>' +
+          '</div>' +
         '</div>' +
         '<div class="re-form-actions">' +
           '<span class="re-form-status" id="rfStatus">' + (r.builtIn ? '内置角色允许修改，但不可删除' : '') + '</span>' +
@@ -1959,6 +2504,8 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       '</div>';
 
     $('rfSave').addEventListener('click', () => {
+      const allowedTools = Array.from(roleEditorRight.querySelectorAll('.tool-perm-btn.allow.active')).map(el => el.dataset.allow);
+      const deniedTools = Array.from(roleEditorRight.querySelectorAll('.tool-perm-btn.deny.active')).map(el => el.dataset.deny);
       const data = {
         name: $('rfName').value.trim(),
         icon: $('rfIcon').value.trim() || '👤',
@@ -1968,6 +2515,8 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
         skills: $('rfSkills').value.split(/[\\n,，]+/).map(s => s.trim()).filter(Boolean),
         skillContent: $('rfSkillContent').value.trim(),
         systemPrompt: $('rfPrompt').value.trim(),
+        allowedTools,
+        deniedTools,
       };
       if (!data.name) { $('rfName').focus(); return; }
       $('rfStatus').textContent = '正在保存…';
@@ -1985,6 +2534,27 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     const delBtn = $('rfDelete');
     if (delBtn) delBtn.addEventListener('click', () => {
       if (editingRoleId) vscode.postMessage({ type:'deleteRole', id:editingRoleId });
+    });
+    // 工具权限 toggle 按钮事件
+    roleEditorRight.querySelectorAll('.tool-perm-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const isAllow = btn.classList.contains('allow');
+        const isDeny = btn.classList.contains('deny');
+        if (isAllow) {
+          btn.classList.toggle('active');
+          // 允许和禁止互斥
+          if (btn.classList.contains('active')) {
+            const denyBtn = btn.parentElement.querySelector('.deny.active');
+            if (denyBtn) denyBtn.classList.remove('active');
+          }
+        } else if (isDeny) {
+          btn.classList.toggle('active');
+          if (btn.classList.contains('active')) {
+            const allowBtn = btn.parentElement.querySelector('.allow.active');
+            if (allowBtn) allowBtn.classList.remove('active');
+          }
+        }
+      });
     });
   }
 
@@ -2047,15 +2617,277 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     }
   });
 
+  // ====== 工具权限弹窗 ======
+  const TOOL_LIST = [
+    {name:'workspace_list_files', label:'列出文件', group:'读取'},
+    {name:'workspace_read_file', label:'读取文件', group:'读取'},
+    {name:'workspace_search', label:'搜索内容', group:'读取'},
+    {name:'workspace_semantic_search', label:'语义搜索', group:'读取'},
+    {name:'git_status', label:'Git 状态', group:'读取'},
+    {name:'git_diff', label:'Git Diff', group:'读取'},
+    {name:'workspace_write_file', label:'写入文件', group:'编辑'},
+    {name:'workspace_replace', label:'替换内容', group:'编辑'},
+    {name:'workspace_apply_diff', label:'Diff 补了', group:'编辑'},
+    {name:'workspace_search_replace', label:'搜索替换', group:'编辑'},
+    {name:'workspace_delete', label:'删除文件', group:'编辑'},
+    {name:'run_command', label:'执行命令', group:'命令'},
+    {name:'dispatch_session_task', label:'派发任务', group:'编排'},
+    {name:'orchestrate_task', label:'自动编排', group:'编排'},
+    {name:'todo_list_create', label:'创建清单', group:'任务'},
+    {name:'todo_list_update', label:'更新清单', group:'任务'},
+    {name:'todo_list_read', label:'读取清单', group:'任务'},
+  ];
+  const toolPermModal = $('toolPermModal');
+  const toolPermGrid = $('toolPermGrid');
+  const toolPermRoleName = $('toolPermRoleName');
+  const toolPermStatus = $('toolPermStatus');
+  const toolPermModalDataset = { sessionId: '' };
+  const btnToolPerm = $('btnToolPerm');
+  if (btnToolPerm) {
+    btnToolPerm.addEventListener('click', () => {
+      vscode.postMessage({ type: 'openToolPermissions', sessionId: curSession });
+    });
+  }
+  $('toolPermClose').addEventListener('click', () => {
+    toolPermModal.style.display = 'none';
+  });
+  function renderToolPermGrid(allowedSet, deniedSet) {
+    const groups = {};
+    TOOL_LIST.forEach(t => { (groups[t.group] = groups[t.group] || []).push(t); });
+    toolPermGrid.innerHTML = Object.entries(groups).map(([groupLabel, tools]) => {
+      const rows = tools.map(t => {
+        const isAllowed = allowedSet.has(t.name);
+        const isDenied = deniedSet.has(t.name);
+        return '<div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;">' +
+          '<span style="font-size:12px;" title="' + t.name + '">' + t.label + '</span>' +
+          '<div style="display:flex;gap:4px;">' +
+            '<span class="tool-perm-btn allow' + (isAllowed ? ' active' : '') + '" data-allow="' + t.name + '" style="padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--border);' + (isAllowed ? 'background:var(--accent-dim);color:var(--accent);border-color:var(--accent);' : '') + '">允许</span>' +
+            '<span class="tool-perm-btn deny' + (isDenied ? ' active' : '') + '" data-deny="' + t.name + '" style="padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--border);' + (isDenied ? 'background:rgba(239,68,68,0.15);color:var(--danger);border-color:var(--danger);' : '') + '">禁止</span>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+      return '<div style="margin-bottom:10px;"><div style="font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;margin-bottom:4px;">' + groupLabel + '</div>' + rows + '</div>';
+    }).join('');
+    toolPermGrid.querySelectorAll('.tool-perm-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const isAllow = btn.classList.contains('allow');
+        if (isAllow) {
+          btn.classList.toggle('active');
+          if (btn.classList.contains('active')) {
+            btn.style.cssText = 'padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--accent);background:var(--accent-dim);color:var(--accent);';
+          } else {
+            btn.style.cssText = 'padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--border);';
+          }
+          const denyBtn = btn.parentElement.querySelector('.deny.active');
+          if (denyBtn && btn.classList.contains('active')) {
+            denyBtn.classList.remove('active');
+            denyBtn.style.cssText = 'padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--border);';
+          }
+        } else {
+          btn.classList.toggle('active');
+          if (btn.classList.contains('active')) {
+            btn.style.cssText = 'padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--danger);background:rgba(239,68,68,0.15);color:var(--danger);';
+          } else {
+            btn.style.cssText = 'padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--border);';
+          }
+          const allowBtn = btn.parentElement.querySelector('.allow.active');
+          if (allowBtn && btn.classList.contains('active')) {
+            allowBtn.classList.remove('active');
+            allowBtn.style.cssText = 'padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--border);';
+          }
+        }
+      });
+    });
+  }
+  $('toolPermSave').addEventListener('click', () => {
+    const allowedTools = Array.from(toolPermGrid.querySelectorAll('.tool-perm-btn.allow.active')).map(el => el.dataset.allow);
+    const deniedTools = Array.from(toolPermGrid.querySelectorAll('.tool-perm-btn.deny.active')).map(el => el.dataset.deny);
+    toolPermStatus.textContent = '保存中…';
+    vscode.postMessage({ type: 'updateToolPermissions', sessionId: toolPermModalDataset.sessionId, allowedTools, deniedTools });
+  });
+
+  // ====== 工具审批弹窗 ======
+  const approvalModal = $('approvalModal');
+  const approvalTitle = $('approvalTitle');
+  const approvalDetail = $('approvalDetail');
+  const approvalRemember = $('approvalRemember');
+  let currentApprovalId = null;
+  let currentApprovalToolName = '';
+  $('approvalApprove').addEventListener('click', () => {
+    if (!currentApprovalId) return;
+    const remember = approvalRemember.checked;
+    if (remember && currentApprovalToolName) {
+      vscode.postMessage({ type: 'toolApprovalResponse', approvalId: currentApprovalId, approved: true, remember: true, toolName: currentApprovalToolName });
+    } else {
+      vscode.postMessage({ type: 'toolApprovalResponse', approvalId: currentApprovalId, approved: true, remember: false });
+    }
+    approvalModal.style.display = 'none';
+    currentApprovalId = null;
+  });
+  $('approvalDenyBtn').addEventListener('click', () => {
+    if (!currentApprovalId) return;
+    vscode.postMessage({ type: 'toolApprovalResponse', approvalId: currentApprovalId, approved: false });
+    approvalModal.style.display = 'none';
+    currentApprovalId = null;
+  });
+  $('approvalDeny').addEventListener('click', () => {
+    if (!currentApprovalId) return;
+    vscode.postMessage({ type: 'toolApprovalResponse', approvalId: currentApprovalId, approved: false });
+    approvalModal.style.display = 'none';
+    currentApprovalId = null;
+  });
+
+  // ─── 命令提示（/ slash 命令 + @ 文件选择）───
+  const SLASH_COMMANDS = [
+    { cmd: '/code', label: '编码模式 — 直接输出可执行代码' },
+    { cmd: '/ask', label: '问答模式 — 简洁准确回答问题' },
+    { cmd: '/debug', label: '调试模式 — 系统化排查问题' },
+    { cmd: '/architect', label: '架构模式 — 架构师视角分析设计' },
+  ];
+  let workspaceFiles = [];
+  window.addEventListener('message', (e) => {
+    const msg = e.data;
+    if (msg.type === 'workspaceFiles' && Array.isArray(msg.files)) {
+      workspaceFiles = msg.files;
+    }
+  });
+
+  function renderCmdHint() {
+    if (cmdHintItems.length === 0) { cmdHintEl.style.display = 'none'; return; }
+    cmdHintActiveIdx = 0;
+    cmdHintEl.innerHTML = cmdHintItems.map((item, i) => {
+      if (item.type === 'slash') {
+        return '<div class="cmd-hint-item' + (i === 0 ? ' active' : '') + '" data-idx="' + i + '">' +
+          '<span class="cmd-hint-cmd">' + esc(item.cmd) + '</span>' +
+          '<span class="cmd-hint-label">' + esc(item.label) + '</span>' +
+        '</div>';
+      } else {
+        return '<div class="cmd-hint-item' + (i === 0 ? ' active' : '') + '" data-idx="' + i + '">' +
+          '<span class="cmd-hint-file-icon">📄</span>' +
+          '<span class="cmd-hint-file-path"><span class="cmd-hint-file-name">' + esc(item.name) + '</span> — ' + esc(item.relPath) + '</span>' +
+        '</div>';
+      }
+    }).join('');
+    cmdHintEl.style.display = 'block';
+    cmdHintEl.querySelectorAll('.cmd-hint-item').forEach(el => {
+      el.addEventListener('click', () => {
+        const idx = Number(el.dataset.idx);
+        selectCmdHint(idx);
+      });
+      el.addEventListener('mouseenter', () => {
+        const idx = Number(el.dataset.idx);
+        setActiveHint(idx);
+      });
+    });
+  }
+
+  function setActiveHint(idx) {
+    cmdHintActiveIdx = idx;
+    const items = cmdHintEl.querySelectorAll('.cmd-hint-item');
+    items.forEach((el, i) => el.classList.toggle('active', i === idx));
+  }
+
+  function selectCmdHint(idx) {
+    const item = cmdHintItems[idx];
+    if (!item) return;
+    if (item.type === 'slash') {
+      const parts = inputEl.value.split(/\s+/);
+      parts[0] = item.cmd;
+      inputEl.value = parts.join(' ') + ' ';
+    } else if (item.type === 'file') {
+      // Replace the @partial with @filePath
+      const before = inputEl.value.substring(0, inputEl.selectionStart);
+      const after = inputEl.value.substring(inputEl.selectionEnd);
+      const atIdx = before.lastIndexOf('@');
+      if (atIdx >= 0) {
+        inputEl.value = before.substring(0, atIdx) + '@' + item.relPath + ' ' + after;
+        const newPos = atIdx + item.relPath.length + 2;
+        inputEl.setSelectionRange(newPos, newPos);
+      } else {
+        inputEl.value = inputEl.value.replace(/@[\w.-]*$/, '@' + item.relPath + ' ');
+      }
+    }
+    hideCmdHint();
+    inputEl.focus();
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
+  }
+
+  function hideCmdHint() {
+    cmdHintEl.style.display = 'none';
+    cmdHintMode = null;
+    cmdHintItems = [];
+  }
+
+  function updateCmdHint() {
+    const v = inputEl.value;
+    const cursorPos = inputEl.selectionStart;
+    const before = v.substring(0, cursorPos);
+
+    // Check for @ trigger — find last @ that's preceded by whitespace or start
+    const atMatch = before.match(/(?:^|\s)@([\w./-]*)$/);
+    if (atMatch) {
+      const query = atMatch[1].toLowerCase();
+      cmdHintMode = 'file';
+      cmdHintItems = workspaceFiles
+        .filter(f => !query || f.relPath.toLowerCase().includes(query) || f.name.toLowerCase().includes(query))
+        .slice(0, 20)
+        .map(f => ({ type: 'file', name: f.name, relPath: f.relPath }));
+      renderCmdHint();
+      return;
+    }
+
+    // Check for / trigger — must be at start of input
+    const trimmed = v.trimStart();
+    if (trimmed.startsWith('/') && !trimmed.includes(' ')) {
+      const typed = trimmed.toLowerCase();
+      cmdHintMode = 'slash';
+      cmdHintItems = SLASH_COMMANDS.filter(c => c.cmd.startsWith(typed))
+        .map(c => ({ type: 'slash', cmd: c.cmd, label: c.label }));
+      renderCmdHint();
+      return;
+    }
+
+    hideCmdHint();
+  }
+
+  inputEl.addEventListener('input', () => {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
+    updateCmdHint();
+  });
   inputEl.addEventListener('keydown', (e) => {
+    if (cmdHintEl.style.display !== 'none' && cmdHintItems.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setActiveHint((cmdHintActiveIdx + 1) % cmdHintItems.length);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setActiveHint((cmdHintActiveIdx - 1 + cmdHintItems.length) % cmdHintItems.length);
+        return;
+      }
+      if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+        e.preventDefault();
+        selectCmdHint(cmdHintActiveIdx);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        hideCmdHint();
+        return;
+      }
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       send();
     }
   });
-  inputEl.addEventListener('input', () => {
-    inputEl.style.height = 'auto';
-    inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
+  document.addEventListener('click', (e) => {
+    if (cmdHintEl.style.display !== 'none' && !cmdHintEl.contains(e.target) && e.target !== inputEl) {
+      hideCmdHint();
+    }
   });
 
   // ─── 接收消息 ───
@@ -2130,6 +2962,9 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
         if (modelNameEl) modelNameEl.textContent = msg.modelName || '未配置模型';
         updateContextUsage(msg.contextUsage);
         break;
+      case 'todoUpdated':
+        renderTodoPanel(msg.sessionId, msg.items);
+        break;
       case 'contextUsage':
         if (msg.sessionId === curSession) updateContextUsage(msg);
         break;
@@ -2141,6 +2976,10 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
         autoFollowOutput = true;
         appendMessage('user', msg.content, msg.createdAt, msg.sessionId);
         scrollBottom(true);
+        break;
+      case 'modeIndicator':
+        if (msg.sessionId !== curSession) break;
+        appendMessage('system', '📋 ' + msg.mode, new Date().toISOString(), msg.sessionId);
         break;
       case 'streamStart': {
         if (msg.sessionId !== curSession) break;
@@ -2158,13 +2997,14 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
         const bubbles = messagesEl.querySelectorAll('.msg-row.assistant .bubble');
         const last = bubbles[bubbles.length-1];
         if (last) {
-          const reasoning = ensureReasoningPanel(last);
-          const followReasoning = reasoning.scrollHeight - reasoning.scrollTop - reasoning.clientHeight <= 48;
-          const raw = reasoning.getAttribute('data-raw') || '';
+          const panel = ensureReasoningPanel(last);
+          const content = panel.querySelector('.reasoning-content');
+          const followReasoning = content.scrollHeight - content.scrollTop - content.clientHeight <= 48;
+          const raw = content.getAttribute('data-raw') || '';
           const newText = raw + msg.delta;
-          reasoning.setAttribute('data-raw', newText);
-          reasoning.textContent = newText;
-          if (followReasoning) reasoning.scrollTop = reasoning.scrollHeight;
+          content.setAttribute('data-raw', newText);
+          content.textContent = newText;
+          if (followReasoning) content.scrollTop = content.scrollHeight;
           scrollBottom(false);
         }
         break;
@@ -2188,18 +3028,29 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       }
       case 'toolStatus': {
         if (msg.sessionId !== curSession) break;
-        const labels = { running: '正在调用工具', completed: '工具调用完成', failed: '工具调用失败' };
         const toolKey = msg.sessionId + ':' + (msg.callId || msg.name || '');
-        currentToolStatusEl = toolStatusElements.get(toolKey) || null;
-        if (!currentToolStatusEl) {
-          currentToolStatusEl = appendMessage('system', '', new Date().toISOString(), msg.sessionId);
-          if (currentToolStatusEl) {
-            currentToolStatusEl.setAttribute('data-tool-key', toolKey);
-            toolStatusElements.set(toolKey, currentToolStatusEl);
-          }
+        const bubbles = messagesEl.querySelectorAll('.msg-row.assistant .bubble');
+        const last = bubbles[bubbles.length-1];
+        if (!last) break;
+        const badges = ensureToolBadges(last);
+        let badge = toolStatusElements.get(toolKey);
+        if (!badge) {
+          badge = document.createElement('span');
+          badge.className = 'tool-badge running';
+          badge.setAttribute('data-tool-key', toolKey);
+          badges.appendChild(badge);
+          toolStatusElements.set(toolKey, badge);
         }
-        if (currentToolStatusEl) {
-          currentToolStatusEl.textContent = (labels[msg.status] || '工具状态') + ': ' + (msg.name || 'unknown') + (msg.status === 'failed' && msg.detail ? ' - ' + msg.detail : '');
+        const toolLabel = msg.name || 'unknown';
+        if (msg.status === 'running') {
+          badge.className = 'tool-badge running';
+          badge.textContent = toolLabel;
+        } else if (msg.status === 'completed') {
+          badge.className = 'tool-badge completed';
+          badge.textContent = toolLabel;
+        } else if (msg.status === 'failed') {
+          badge.className = 'tool-badge failed';
+          badge.textContent = toolLabel + (msg.detail ? ' — ' + msg.detail : '');
         }
         scrollBottom(false);
         break;
@@ -2215,9 +3066,13 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
             last.removeAttribute('data-raw');
             last.innerHTML = renderMarkdown(msg.fullText);
             if (msg.reasoningText) {
-              const reasoning = ensureReasoningPanel(last);
-              reasoning.removeAttribute('data-raw');
-              reasoning.textContent = msg.reasoningText;
+              const panel = ensureReasoningPanel(last);
+              panel.classList.remove('is-streaming');
+              panel.querySelector('summary').textContent = '思考过程';
+              const content = panel.querySelector('.reasoning-content');
+              content.classList.remove('is-streaming');
+              content.removeAttribute('data-raw');
+              content.textContent = msg.reasoningText;
             }
           }
         } else {
@@ -2241,9 +3096,13 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
           last.removeAttribute('data-raw');
           last.innerHTML = msg.fullText ? renderMarkdown(msg.fullText) : '(生成失败)';
           if (msg.reasoningText) {
-            const reasoning = ensureReasoningPanel(last);
-            reasoning.removeAttribute('data-raw');
-            reasoning.textContent = msg.reasoningText;
+            const panel = ensureReasoningPanel(last);
+            panel.classList.remove('is-streaming');
+            panel.querySelector('summary').textContent = '思考过程';
+            const content = panel.querySelector('.reasoning-content');
+            content.classList.remove('is-streaming');
+            content.removeAttribute('data-raw');
+            content.textContent = msg.reasoningText;
           }
         }
         currentToolStatusEl = null;
@@ -2263,6 +3122,25 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       case 'error':
         setStreaming(false);
         appendMessage('system', '❌ ' + msg.message, new Date().toISOString(), msg.sessionId);
+        break;
+      case 'toolPermissionsData':
+        toolPermRoleName.textContent = msg.roleName || '';
+        toolPermModalDataset.sessionId = msg.sessionId || '';
+        renderToolPermGrid(new Set(msg.allowedTools || []), new Set(msg.deniedTools || []));
+        toolPermStatus.textContent = '';
+        toolPermModal.style.display = 'flex';
+        break;
+      case 'toolPermissionsSaved':
+        toolPermStatus.textContent = '✅ 已保存，当前会话立即生效';
+        setTimeout(() => { toolPermModal.style.display = 'none'; }, 600);
+        break;
+      case 'toolApprovalRequest':
+        currentApprovalId = msg.approvalId;
+        currentApprovalToolName = msg.toolName || '';
+        approvalTitle.textContent = msg.title || '⚠️ 工具审批';
+        approvalDetail.textContent = msg.detail || '';
+        approvalRemember.checked = false;
+        approvalModal.style.display = 'flex';
         break;
     }
   });

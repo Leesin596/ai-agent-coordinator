@@ -7,13 +7,20 @@ import type { CoordinatorContext, ActiveWorkspaceRuntime } from '../backend/coor
 import type { Role, Session } from '../../../src/models/types';
 import { LLMService, estimateMessageTokens, type LLMMessage, type LLMConfig, type LLMToolCall } from '../services/llm-service';
 import { COORDINATOR_LLM_TOOLS } from '../services/llm-api';
+import { filterToolsByRole, isToolAllowedByRole } from '../services/tool-filter';
+import { parseSlashCommand } from '../services/slash-commands';
 import { buildWorkspaceContext } from '../services/workspace-context';
-import { WorkspaceToolExecutor } from '../services/workspace-tools';
+import { WorkspaceToolExecutor, type ToolApprovalRequest } from '../services/workspace-tools';
+import { CheckpointManager } from '../services/checkpoint-manager';
+import { shouldAutoApprove } from '../services/approval-helper';
+import { TerminalService } from '../services/terminal-service';
 import {
   buildSessionContextPackage,
   listContextSessionOptions,
   type ContextTransferMode,
 } from '../services/context-transfer';
+import { OrchestratorService } from '../../../src/core/orchestrator-service';
+import type { LLMCallFunction } from '../../../src/models/types';
 
 // 活跃面板缓存：sessionId → ChatPanel
 const activePanels = new Map<string, ChatPanel>();
@@ -38,6 +45,7 @@ export class ChatPanel {
   private panel: vscode.WebviewPanel;
   private llm = new LLMService();
   private toolExecutor: WorkspaceToolExecutor;
+  private terminalService = new TerminalService();
   private abortFn: (() => void) | null = null;
   private isStreaming = false;
   private role: Role;
@@ -45,6 +53,8 @@ export class ChatPanel {
   private ctx: CoordinatorContext;
   private runtime: ActiveWorkspaceRuntime;
   private disposables: vscode.Disposable[] = [];
+  private orchestrator = new OrchestratorService();
+  private pendingApprovals = new Map<string, { resolve: (v: boolean) => void; timeout: NodeJS.Timeout }>();
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -59,13 +69,29 @@ export class ChatPanel {
     this.role = role;
     this.session = session;
     this.toolExecutor = new WorkspaceToolExecutor(runtime.workspace.folderPath, async (request) => {
-      const choice = await vscode.window.showWarningMessage(
-        request.title,
-        { modal: true, detail: request.detail },
-        request.confirmLabel,
-      );
-      return choice === request.confirmLabel;
+      if (request.toolName && shouldAutoApprove(request.toolName)) return true;
+      if (request.toolName && this.role.allowedTools?.includes(request.toolName)) return true;
+      // Webview 内审批弹窗
+      const approvalId = `approval_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      this.sendToWebview({
+        type: 'toolApprovalRequest',
+        approvalId,
+        title: request.title,
+        detail: request.detail,
+        confirmLabel: request.confirmLabel,
+        toolName: request.toolName || '',
+      });
+      return new Promise<boolean>((resolve) => {
+        const timeout = setTimeout(() => {
+          this.pendingApprovals.delete(approvalId);
+          resolve(false);
+        }, 300000); // 5 min timeout
+        this.pendingApprovals.set(approvalId, { resolve, timeout });
+      });
     });
+    this.toolExecutor.setRole(role);
+    this.toolExecutor.setCheckpointManager(new CheckpointManager(runtime.workspace.folderPath));
+    this.toolExecutor.setTerminalRunner(this.terminalService.createRunner());
 
     this.panel.title = `${role.icon || '💬'} ${session.title}`;
 
@@ -187,20 +213,73 @@ export class ChatPanel {
         // 点击模型名标签 → 聚焦左侧「模型设置」view
         vscode.commands.executeCommand('coordinator.sidebar.focus');
         break;
+      case 'openToolPermissions':
+        this.sendToWebview({
+          type: 'toolPermissionsData',
+          roleId: this.role.id,
+          roleName: this.role.name,
+          allowedTools: this.role.allowedTools || [],
+          deniedTools: this.role.deniedTools || [],
+        });
+        break;
+      case 'updateToolPermissions':
+        await this.handleUpdateToolPermissions(msg.allowedTools || [], msg.deniedTools || []);
+        break;
+      case 'toolApprovalResponse':
+        this.handleToolApprovalResponse(msg.approvalId, msg.approved, msg.remember, msg.toolName);
+        break;
+    }
+  }
+
+  private async handleUpdateToolPermissions(allowedTools: string[], deniedTools: string[]): Promise<void> {
+    const runtime = this.runtime;
+    runtime.roleManager.update(this.role.id, { allowedTools, deniedTools });
+    // 立即刷新当前会话的 role 引用
+    const updatedRole = runtime.roleManager.get(this.role.id);
+    if (updatedRole) {
+      this.role = updatedRole;
+      this.toolExecutor.setRole(updatedRole);
+      runtime.sessionManager.syncRoleToSessions(updatedRole, runtime.workspace.id);
+    }
+    this.sendToWebview({ type: 'toolPermissionsSaved' });
+  }
+
+  private handleToolApprovalResponse(approvalId: string, approved: boolean, remember: boolean, toolName?: string): void {
+    const pending = this.pendingApprovals.get(approvalId);
+    if (!pending) return;
+    clearTimeout(pending.timeout);
+    this.pendingApprovals.delete(approvalId);
+    pending.resolve(approved);
+    if (remember && approved && toolName) {
+      const config = vscode.workspace.getConfiguration('coordinator.autoApprove');
+      const tools = config.get<string[]>('tools', []);
+      if (!tools.includes(toolName)) {
+        tools.push(toolName);
+        config.update('tools', tools, vscode.ConfigurationTarget.Workspace);
+      }
     }
   }
 
   private async handleSendMessage(content: string): Promise<void> {
     if (this.isStreaming || !content.trim()) return;
 
+    // Slash 命令解析
+    const { content: actualContent, modePrompt, mode } = parseSlashCommand(content);
+    if (!actualContent.trim()) return;
+
     const config = this.getLLMConfig(this.session.id);
-    if (!config.apiKey) {
+    const isLocalProvider = /localhost|127\.0\.0\.1|0\.0\.0\.0/i.test(config.baseURL);
+    const apiKeyOptional = isLocalProvider || config.apiKeyRequired === false;
+    if (!config.apiKey && !apiKeyOptional) {
       this.sendToWebview({ type: 'error', message: '未配置模型 API Key，请在左侧「模型设置」中添加模型预设' });
       return;
     }
 
-    this.runtime.sessionManager.addMessage(this.session.id, 'user', content);
-    this.sendToWebview({ type: 'userMessage', content });
+    this.runtime.sessionManager.addMessage(this.session.id, 'user', actualContent);
+    this.sendToWebview({ type: 'userMessage', content: actualContent });
+    if (mode) {
+      this.sendToWebview({ type: 'modeIndicator', mode });
+    }
 
     this.isStreaming = true;
     this.sendToWebview({ type: 'streamStart' });
@@ -211,20 +290,31 @@ export class ChatPanel {
       this.ctx,
       this.runtime,
       this.session.id,
-      content,
+      actualContent,
     );
     const systemIdx = messages.findIndex((m) => m.role === 'system');
     if (systemIdx >= 0) {
-      messages.splice(systemIdx + 1, 0, { role: 'system', content: workspaceContext } as LLMMessage);
+      const existing = messages[systemIdx];
+      messages[systemIdx] = { role: 'system', content: `${existing.content}\n\n${workspaceContext}` } as LLMMessage;
     } else {
       messages.unshift({ role: 'system', content: workspaceContext } as LLMMessage);
+    }
+    // 注入 slash 命令模式提示（合并到首条 system 消息，避免多条 system 被部分 provider 丢弃）
+    if (modePrompt) {
+      const idx = messages.findIndex((m) => m.role === 'system');
+      if (idx >= 0) {
+        messages[idx] = { role: 'system', content: `${messages[idx].content}\n\n${modePrompt}` } as LLMMessage;
+      } else {
+        messages.unshift({ role: 'system', content: modePrompt } as LLMMessage);
+      }
     }
 
     this.sendContextUsage(messages, config.contextWindow);
     this.toolExecutor.begin();
 
     let usedNativeTool = false;
-    this.abortFn = this.llm.streamChat(messages, { ...config, tools: COORDINATOR_LLM_TOOLS }, {
+    const roleFilteredTools = filterToolsByRole(COORDINATOR_LLM_TOOLS, this.role);
+    this.abortFn = this.llm.streamChat(messages, { ...config, tools: roleFilteredTools }, {
       onChunk: (delta) => {
         this.sendToWebview({ type: 'streamChunk', delta });
       },
@@ -243,10 +333,8 @@ export class ChatPanel {
         this.abortFn = null;
         if (fullText) this.runtime.sessionManager.addMessage(this.session.id, 'assistant', fullText);
         this.sendToWebview({ type: 'streamEnd', fullText, reasoningText });
-        this.sendContextUsage(
-          [...messages, { content: fullText }],
-          config.contextWindow,
-        );
+        // 从 DB 重新读取消息（包含刚写入的 assistant 回复），并重建 workspace context
+        this.sendToWebview({ type: 'contextUsage', ...this.getFullContextUsage() });
         // 自动解析并执行派发指令
         if (!usedNativeTool) this.parseAndDispatch(fullText);
       },
@@ -318,7 +406,18 @@ export class ChatPanel {
   }
 
   private async executeToolCall(call: LLMToolCall): Promise<string> {
-    if (call.name !== 'dispatch_session_task') return this.toolExecutor.execute(call);
+    if (call.name === 'orchestrate_task') {
+      if (!isToolAllowedByRole(call.name, this.role)) {
+        throw new Error(`角色「${this.role?.name || '未知'}」无权使用工具: ${call.name}`);
+      }
+      return this.executeOrchestrateTask(call);
+    }
+    if (call.name !== 'dispatch_session_task') {
+      if (!isToolAllowedByRole(call.name, this.role)) {
+        throw new Error(`角色「${this.role.name}」无权使用工具: ${call.name}`);
+      }
+      return this.toolExecutor.execute(call);
+    }
     let input: unknown;
     try {
       input = JSON.parse(call.arguments || '{}');
@@ -339,6 +438,73 @@ export class ChatPanel {
       throw new Error('工具参数超过允许长度');
     }
     return JSON.stringify({ ok: true, ...this.dispatchSessionTask(block) });
+  }
+
+  private async executeOrchestrateTask(call: LLMToolCall): Promise<string> {
+    let input: unknown;
+    try {
+      input = JSON.parse(call.arguments || '{}');
+    } catch {
+      throw new Error('工具参数不是有效的 JSON');
+    }
+    if (!input || typeof input !== 'object') throw new Error('工具参数必须是对象');
+    const values = input as Record<string, unknown>;
+    const description = typeof values.description === 'string' ? values.description.trim() : '';
+    if (!description) throw new Error('description 为必填字符串');
+    if (description.length > 20000) throw new Error('description 超过允许长度');
+    const context = typeof values.context === 'string' ? values.context.trim().slice(0, 10000) : '';
+    const maxSubTasks = typeof values.maxSubTasks === 'number' && values.maxSubTasks >= 1 && values.maxSubTasks <= 10
+      ? Math.floor(values.maxSubTasks)
+      : 5;
+
+    this.orchestrator.setDB(this.runtime.db);
+    this.orchestrator.setEventBus(this.runtime.eventBus);
+    this.orchestrator.setDispatcher(this.runtime.dispatcher);
+    this.orchestrator.setSessionManager(this.runtime.sessionManager);
+    this.orchestrator.setRoleManager(this.runtime.roleManager);
+
+    const config = this.getLLMConfig(this.session.id);
+    const llmCall: LLMCallFunction = (messages, options) =>
+      this.llm.chat(messages as LLMMessage[], {
+        ...config,
+        temperature: options?.temperature ?? 0.3,
+        maxTokens: options?.maxTokens,
+        tools: undefined,
+      });
+
+    this.sendToWebview({ type: 'systemMessage', content: `🔄 开始自动编排任务: ${description.slice(0, 100)}...` });
+
+    try {
+      const result = await this.orchestrator.orchestrate(
+        {
+          description,
+          context,
+          sourceSessionId: this.session.id,
+          workspaceId: this.runtime.workspace.id,
+          maxSubTasks,
+        },
+        llmCall,
+      );
+
+      const summaryMsg = [
+        `## 编排结果: ${result.status === 'completed' ? '✅ 全部完成' : result.status === 'partial' ? '⚠️ 部分完成' : '❌ 失败'}`,
+        '',
+        result.summary,
+        '',
+        '### 子任务执行情况',
+        ...result.subTaskResults.map((r) =>
+          `- ${r.status === 'completed' ? '✅' : r.status === 'cancelled' ? '🚫' : '❌'} **${r.title}** → ${r.targetRole}: ${r.result.slice(0, 200)}`,
+        ),
+      ].join('\n');
+      this.runtime.sessionManager.addMessage(this.session.id, 'system', summaryMsg);
+      this.sendToWebview({ type: 'systemMessage', content: summaryMsg });
+
+      return JSON.stringify({ ok: true, result });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.sendToWebview({ type: 'error', message: `编排失败: ${message}` });
+      throw new Error(`编排失败: ${message}`);
+    }
   }
 
   private dispatchSessionTask(block: { target: string; title: string; objective: string }): {
@@ -596,10 +762,7 @@ export class ChatPanel {
         builtIn: this.role.builtIn,
       },
       modelName: this.getCurrentModelName(),
-      contextUsage: this.getContextUsage(
-        this.runtime.sessionManager.getConversationMessages(this.session.id) as LLMMessage[],
-        this.getLLMConfig(this.session.id).contextWindow,
-      ),
+      contextUsage: this.getFullContextUsage(),
       session: { id: this.session.id, title: this.session.title },
       messages: messages.map((m) => ({
         role: m.role,
@@ -607,6 +770,43 @@ export class ChatPanel {
         createdAt: m.createdAt,
       })),
     });
+
+    this.pushWorkspaceFiles();
+  }
+
+  private pushWorkspaceFiles(): void {
+    try {
+      const fs = require('fs') as typeof import('fs');
+      const path = require('path') as typeof import('path');
+      const folderPath = this.runtime.workspace.folderPath;
+      const excludeDirs = new Set(['node_modules', '.git', 'dist', 'out', '.coordinator', '.vscode', 'build']);
+      const excludeExts = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg', '.woff', '.woff2', '.ttf', '.eot', '.mp4', '.mp3', '.zip', '.tar', '.gz', '.lock']);
+      const files: { name: string; relPath: string }[] = [];
+      const walk = (dir: string, depth: number) => {
+        if (depth > 4 || files.length > 500) return;
+        let entries: string[];
+        try { entries = fs.readdirSync(dir); } catch { return; }
+        for (const entry of entries) {
+          if (entry.startsWith('.') && entry !== '.github') continue;
+          const full = path.join(dir, entry);
+          let stat;
+          try { stat = fs.statSync(full); } catch { continue; }
+          if (stat.isDirectory()) {
+            if (excludeDirs.has(entry)) continue;
+            walk(full, depth + 1);
+          } else {
+            const ext = path.extname(entry).toLowerCase();
+            if (excludeExts.has(ext)) continue;
+            const relPath = path.relative(folderPath, full).replace(/\\/g, '/');
+            files.push({ name: entry, relPath });
+          }
+        }
+      };
+      walk(folderPath, 0);
+      this.sendToWebview({ type: 'workspaceFiles', files });
+    } catch {
+      // ignore
+    }
   }
 
   private getLLMConfig(sessionId?: string): LLMConfig {
@@ -624,6 +824,7 @@ export class ChatPanel {
             temperature: preset.temperature ?? 0.7,
             contextWindow: preset.contextWindow ?? 1000000,
             thinkingStrength: preset.thinkingStrength ?? 'xhigh',
+            apiKeyRequired: preset.apiKeyRequired,
           };
         }
       }
@@ -639,6 +840,7 @@ export class ChatPanel {
         temperature: def.temperature ?? 0.7,
         contextWindow: def.contextWindow ?? 1000000,
         thinkingStrength: def.thinkingStrength ?? 'xhigh',
+        apiKeyRequired: def.apiKeyRequired,
       };
     }
     // 3. 兜底：全局 configuration
@@ -658,6 +860,27 @@ export class ChatPanel {
     const limit = Math.max(1, contextWindow);
     const used = estimateMessageTokens(messages);
     return { used, limit, percent: Math.min(100, Math.round((used / limit) * 100)) };
+  }
+
+  /**
+   * 计算包含工作区上下文的真实上下文占用。
+   * 使用最后一条 user 消息作为 query 来构建 workspace context，
+   * 保证和 handleSendMessage 中发给 LLM 的消息序列一致。
+   */
+  private getFullContextUsage(): { used: number; limit: number; percent: number } {
+    const config = this.getLLMConfig(this.session.id);
+    const messages = this.runtime.sessionManager.getConversationMessages(this.session.id) as LLMMessage[];
+    // 取最后一条 user 消息作为 query
+    const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+    const query = lastUser?.content || '';
+    const workspaceContext = buildWorkspaceContext(this.ctx, this.runtime, this.session.id, query);
+    const systemIdx = messages.findIndex((m) => m.role === 'system');
+    if (systemIdx >= 0) {
+      messages[systemIdx] = { role: 'system', content: `${messages[systemIdx].content}\n\n${workspaceContext}` } as LLMMessage;
+    } else {
+      messages.unshift({ role: 'system', content: workspaceContext } as LLMMessage);
+    }
+    return this.getContextUsage(messages, config.contextWindow);
   }
 
   private sendContextUsage(messages: Array<{ content: string }>, contextWindow = 1000000): void {
@@ -684,7 +907,7 @@ export class ChatPanel {
     this.sendToWebview({
       type: 'modelName',
       modelName: this.getCurrentModelName(),
-      contextUsage: this.getContextUsage(messages, config.contextWindow),
+      contextUsage: this.getFullContextUsage(),
     });
   }
 
@@ -694,6 +917,7 @@ export class ChatPanel {
 
   private dispose(): void {
     this.handleAbort();
+    this.terminalService.dispose();
     activePanels.delete(this.session.id);
     broadcastSessionChange(); // 通知所有面板刷新标签栏
     this.ctx.getModelsProvider()?.refreshSessions?.(); // 通知左侧刷新会话列表
@@ -983,6 +1207,13 @@ export class ChatPanel {
     border-radius: var(--radius-md);
     background: rgba(255,255,255,0.025);
     color: var(--text-secondary);
+    transition: border-color 0.3s;
+  }
+  .reasoning-panel.is-streaming {
+    border-color: rgba(100,160,255,0.35);
+  }
+  .reasoning-panel.is-streaming summary {
+    color: #6ba3ff;
   }
   .reasoning-panel summary {
     cursor: pointer;
@@ -990,6 +1221,20 @@ export class ChatPanel {
     color: var(--text-muted);
     font-size: 11px;
     user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .reasoning-panel.is-streaming summary::before {
+    content: '';
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: #6ba3ff;
+    animation: pulseDot 1s ease-in-out infinite;
+  }
+  @keyframes pulseDot {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 1; }
   }
   .reasoning-content {
     padding: 0 10px 9px;
@@ -999,6 +1244,68 @@ export class ChatPanel {
     line-height: 1.55;
     max-height: 280px;
     overflow: auto;
+  }
+  .reasoning-content.is-streaming::after {
+    content: '▊';
+    animation: blinkCursor 0.8s step-end infinite;
+    color: #6ba3ff;
+    font-size: 10px;
+  }
+
+  /* 内联工具徽章 */
+  .tool-badges {
+    margin: 0 0 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .tool-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 9px;
+    border-radius: 10px;
+    font-size: 11px;
+    line-height: 1.4;
+    border: 1px solid var(--border-subtle);
+    background: rgba(255,255,255,0.03);
+    color: var(--text-secondary);
+    max-width: fit-content;
+    transition: all 0.25s;
+  }
+  .tool-badge.running {
+    border-color: rgba(100,160,255,0.3);
+    color: #6ba3ff;
+  }
+  .tool-badge.running::before {
+    content: '';
+    width: 8px; height: 8px;
+    border: 1.5px solid #6ba3ff;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spinBadge 0.6s linear infinite;
+    flex-shrink: 0;
+  }
+  .tool-badge.completed {
+    border-color: rgba(80,200,120,0.25);
+    color: #5ac878;
+  }
+  .tool-badge.completed::before {
+    content: '✓';
+    font-size: 10px;
+    font-weight: 700;
+  }
+  .tool-badge.failed {
+    border-color: rgba(240,100,100,0.3);
+    color: #f06464;
+  }
+  .tool-badge.failed::before {
+    content: '✕';
+    font-size: 10px;
+    font-weight: 700;
+  }
+  @keyframes spinBadge {
+    to { transform: rotate(360deg); }
   }
 
   /* 角色标签 + 时间戳 */
@@ -1210,6 +1517,25 @@ export class ChatPanel {
   .input-container textarea::placeholder {
     color: var(--text-muted);
   }
+  .input-container { position: relative; }
+  .cmd-hint {
+    position: absolute; bottom: 100%; left: 0; right: 0;
+    max-height: 240px; overflow-y: auto;
+    background: var(--bg-elevated); border: 1px solid var(--border);
+    border-radius: var(--radius-md); box-shadow: 0 -4px 16px rgba(0,0,0,.25);
+    z-index: 200; margin-bottom: 4px;
+  }
+  .cmd-hint-item {
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px; cursor: pointer;
+    border-bottom: 1px solid var(--border-subtle); font-size: 12px;
+  }
+  .cmd-hint-item:last-child { border-bottom: none; }
+  .cmd-hint-item:hover, .cmd-hint-item.active { background: var(--bg-hover); }
+  .cmd-hint-cmd { font-weight: 600; color: var(--accent); min-width: 80px; }
+  .cmd-hint-label { color: var(--text-secondary); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cmd-hint-file-icon { color: var(--text-muted); font-size: 14px; flex-shrink: 0; }
+  .cmd-hint-file-path { color: var(--text-primary); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; }
+  .cmd-hint-file-name { color: var(--accent); font-weight: 600; }
   .send-btn {
     display: flex;
     align-items: center;
@@ -1460,7 +1786,7 @@ export class ChatPanel {
 
     <!-- 输入框 -->
     <div class="input-container">
-      <textarea id="input" placeholder="输入消息，按 Enter 发送，Shift+Enter 换行" rows="1"></textarea>
+      <textarea id="input" placeholder="输入消息 · / 模式 · @ 文件" rows="1"></textarea>
       <button class="send-btn" id="btnSend" title="发送 (Enter)">➤</button>
     </div>
 
@@ -1471,6 +1797,7 @@ export class ChatPanel {
       <button class="toolbar-btn" title="搜索">🔍<span class="tooltip">搜索</span></button>
       <button class="toolbar-btn" id="btnTrash" title="清空">🗑️<span class="tooltip">清空对话</span></button>
       <div class="toolbar-spacer"></div>
+      <button class="toolbar-btn" id="btnToolPerm" title="工具权限">🛠️<span class="tooltip">工具权限</span></button>
       <button class="toolbar-btn" title="复制最后回复">📋<span class="tooltip">复制</span></button>
       <button class="toolbar-btn" title="重新生成">🔄<span class="tooltip">重新生成</span></button>
       <button class="toolbar-btn" id="btnModel" title="点击在左侧「模型设置」切换模型">🤖<span class="model-name" id="modelName">未配置模型</span><span class="tooltip">在左侧切换模型</span></button>
@@ -1478,6 +1805,46 @@ export class ChatPanel {
   </div>
 
   <!-- 模型切换已收敛到左侧「模型设置」视图 -->
+
+  <!-- 工具权限弹窗 -->
+  <div class="modal-overlay" id="toolPermModal">
+    <div class="settings-modal" style="width:480px;">
+      <div class="modal-header">
+        <h3>🛠️ 工具权限 — <span id="toolPermRoleName"></span></h3>
+        <button class="modal-close-btn" id="toolPermClose">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="setting-hint" style="margin-bottom:10px;">允许 = 白名单模式（仅启用选中工具，留空=继承全部）；禁止 = 黑名单（优先排除）。</div>
+        <div id="toolPermGrid"></div>
+      </div>
+      <div class="modal-footer">
+        <span class="config-status" id="toolPermStatus"></span>
+        <button class="btn-modal btn-modal-primary" id="toolPermSave">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 工具审批弹窗 -->
+  <div class="modal-overlay" id="approvalModal">
+    <div class="settings-modal" style="width:520px;">
+      <div class="modal-header">
+        <h3 id="approvalTitle">⚠️ 工具审批</h3>
+        <button class="modal-close-btn" id="approvalDeny" title="拒绝">✕</button>
+      </div>
+      <div class="modal-body">
+        <pre id="approvalDetail" style="white-space:pre-wrap;font-size:12px;line-height:1.6;color:var(--text-secondary);font-family:var(--vscode-editor-font-family,monospace);max-height:300px;overflow-y:auto;"></pre>
+      </div>
+      <div class="modal-footer">
+        <span class="config-status" id="approvalStatus" style="flex:1;">
+          <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer;">
+            <input type="checkbox" id="approvalRemember" style="margin:0;"> 记住选择（后续自动批准此工具）
+          </label>
+        </span>
+        <button class="btn-modal" id="approvalDenyBtn">拒绝</button>
+        <button class="btn-modal btn-modal-primary" id="approvalApprove">允许</button>
+      </div>
+    </div>
+  </div>
 
 <script>
   const vscode = acquireVsCodeApi();
@@ -1490,6 +1857,15 @@ export class ChatPanel {
   const tabBarEl = document.getElementById('tabBar');
   const tabAddBtn = document.getElementById('tabAddBtn');
   const timerDisplayEl = document.getElementById('timerDisplay');
+  const inputContainer = document.querySelector('.input-container');
+  const cmdHintEl = document.createElement('div');
+  cmdHintEl.className = 'cmd-hint';
+  cmdHintEl.style.display = 'none';
+  if (inputContainer) inputContainer.appendChild(cmdHintEl);
+  let cmdHintMode = null;
+  let cmdHintItems = [];
+  let cmdHintActiveIdx = 0;
+  let workspaceFiles = [];
 
   let isStreaming = false;
   let currentAssistantEl = null;
@@ -1629,12 +2005,24 @@ export class ChatPanel {
     let panel = wrapper.querySelector('.reasoning-panel');
     if (!panel) {
       panel = document.createElement('details');
-      panel.className = 'reasoning-panel';
+      panel.className = 'reasoning-panel is-streaming';
       panel.open = true;
-      panel.innerHTML = '<summary>思考过程</summary><div class="reasoning-content"></div>';
+      panel.innerHTML = '<summary>思考中...</summary><div class="reasoning-content is-streaming"></div>';
       wrapper.insertBefore(panel, bubble);
     }
-    return panel.querySelector('.reasoning-content');
+    return panel;
+  }
+
+  function ensureToolBadges(bubble) {
+    if (!bubble) return null;
+    const wrapper = bubble.parentElement;
+    let container = wrapper.querySelector('.tool-badges');
+    if (!container) {
+      container = document.createElement('div');
+      container.className = 'tool-badges';
+      wrapper.insertBefore(container, bubble);
+    }
+    return container;
   }
 
   function appendMessage(role, content, createdAt) {
@@ -1721,8 +2109,112 @@ export class ChatPanel {
     vscode.postMessage({ type: 'injectContext' });
   });
 
+  // ─── 命令提示（/ slash 命令 + @ 文件选择）───
+  const SLASH_COMMANDS = [
+    { cmd: '/code', label: '编码模式 — 直接输出可执行代码' },
+    { cmd: '/ask', label: '问答模式 — 简洁准确回答问题' },
+    { cmd: '/debug', label: '调试模式 — 系统化排查问题' },
+    { cmd: '/architect', label: '架构模式 — 架构师视角分析设计' },
+  ];
+  function esc(s) {
+    if (s == null) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function renderCmdHint() {
+    if (cmdHintItems.length === 0) { cmdHintEl.style.display = 'none'; return; }
+    cmdHintActiveIdx = 0;
+    cmdHintEl.innerHTML = cmdHintItems.map((item, i) => {
+      if (item.type === 'slash') {
+        return '<div class="cmd-hint-item' + (i === 0 ? ' active' : '') + '" data-idx="' + i + '">' +
+          '<span class="cmd-hint-cmd">' + esc(item.cmd) + '</span>' +
+          '<span class="cmd-hint-label">' + esc(item.label) + '</span>' +
+        '</div>';
+      } else {
+        return '<div class="cmd-hint-item' + (i === 0 ? ' active' : '') + '" data-idx="' + i + '">' +
+          '<span class="cmd-hint-file-icon">📄</span>' +
+          '<span class="cmd-hint-file-path"><span class="cmd-hint-file-name">' + esc(item.name) + '</span> — ' + esc(item.relPath) + '</span>' +
+        '</div>';
+      }
+    }).join('');
+    cmdHintEl.style.display = 'block';
+    cmdHintEl.querySelectorAll('.cmd-hint-item').forEach(el => {
+      el.addEventListener('click', () => { selectCmdHint(Number(el.dataset.idx)); });
+      el.addEventListener('mouseenter', () => { setActiveHint(Number(el.dataset.idx)); });
+    });
+  }
+
+  function setActiveHint(idx) {
+    cmdHintActiveIdx = idx;
+    cmdHintEl.querySelectorAll('.cmd-hint-item').forEach((el, i) => el.classList.toggle('active', i === idx));
+  }
+
+  function selectCmdHint(idx) {
+    const item = cmdHintItems[idx];
+    if (!item) return;
+    if (item.type === 'slash') {
+      const parts = inputEl.value.split(/\s+/);
+      parts[0] = item.cmd;
+      inputEl.value = parts.join(' ') + ' ';
+    } else if (item.type === 'file') {
+      const before = inputEl.value.substring(0, inputEl.selectionStart);
+      const after = inputEl.value.substring(inputEl.selectionEnd);
+      const atIdx = before.lastIndexOf('@');
+      if (atIdx >= 0) {
+        inputEl.value = before.substring(0, atIdx) + '@' + item.relPath + ' ' + after;
+        const newPos = atIdx + item.relPath.length + 2;
+        inputEl.setSelectionRange(newPos, newPos);
+      } else {
+        inputEl.value = inputEl.value.replace(/@[\w.-]*$/, '@' + item.relPath + ' ');
+      }
+    }
+    hideCmdHint();
+    inputEl.focus();
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 130) + 'px';
+  }
+
+  function hideCmdHint() {
+    cmdHintEl.style.display = 'none';
+    cmdHintMode = null;
+    cmdHintItems = [];
+  }
+
+  function updateCmdHint() {
+    const v = inputEl.value;
+    const cursorPos = inputEl.selectionStart;
+    const before = v.substring(0, cursorPos);
+    const atMatch = before.match(/(?:^|\s)@([\w./-]*)$/);
+    if (atMatch) {
+      const query = atMatch[1].toLowerCase();
+      cmdHintMode = 'file';
+      cmdHintItems = workspaceFiles
+        .filter(f => !query || f.relPath.toLowerCase().includes(query) || f.name.toLowerCase().includes(query))
+        .slice(0, 20)
+        .map(f => ({ type: 'file', name: f.name, relPath: f.relPath }));
+      renderCmdHint();
+      return;
+    }
+    const trimmed = v.trimStart();
+    if (trimmed.startsWith('/') && !trimmed.includes(' ')) {
+      const typed = trimmed.toLowerCase();
+      cmdHintMode = 'slash';
+      cmdHintItems = SLASH_COMMANDS.filter(c => c.cmd.startsWith(typed))
+        .map(c => ({ type: 'slash', cmd: c.cmd, label: c.label }));
+      renderCmdHint();
+      return;
+    }
+    hideCmdHint();
+  }
+
   // 键盘快捷键
   inputEl.addEventListener('keydown', (e) => {
+    if (cmdHintEl.style.display !== 'none' && cmdHintItems.length > 0) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); setActiveHint((cmdHintActiveIdx + 1) % cmdHintItems.length); return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); setActiveHint((cmdHintActiveIdx - 1 + cmdHintItems.length) % cmdHintItems.length); return; }
+      if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) { e.preventDefault(); selectCmdHint(cmdHintActiveIdx); return; }
+      if (e.key === 'Escape') { e.preventDefault(); hideCmdHint(); return; }
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       sendMessage();
@@ -1733,6 +2225,12 @@ export class ChatPanel {
   inputEl.addEventListener('input', () => {
     inputEl.style.height = 'auto';
     inputEl.style.height = Math.min(inputEl.scrollHeight, 130) + 'px';
+    updateCmdHint();
+  });
+  document.addEventListener('click', (e) => {
+    if (cmdHintEl.style.display !== 'none' && !cmdHintEl.contains(e.target) && e.target !== inputEl) {
+      hideCmdHint();
+    }
   });
 
   // ====== 模型名标签：点击跳转左侧「模型设置」切换模型 ======
@@ -1744,10 +2242,135 @@ export class ChatPanel {
     });
   }
 
+  // ====== 工具权限弹窗 ======
+  const TOOL_LIST = [
+    {name:'workspace_list_files', label:'列出文件', group:'读取'},
+    {name:'workspace_read_file', label:'读取文件', group:'读取'},
+    {name:'workspace_search', label:'搜索内容', group:'读取'},
+    {name:'workspace_semantic_search', label:'语义搜索', group:'读取'},
+    {name:'git_status', label:'Git 状态', group:'读取'},
+    {name:'git_diff', label:'Git Diff', group:'读取'},
+    {name:'workspace_write_file', label:'写入文件', group:'编辑'},
+    {name:'workspace_replace', label:'替换内容', group:'编辑'},
+    {name:'workspace_apply_diff', label:'Diff 补丁', group:'编辑'},
+    {name:'workspace_search_replace', label:'搜索替换', group:'编辑'},
+    {name:'workspace_delete', label:'删除文件', group:'编辑'},
+    {name:'run_command', label:'执行命令', group:'命令'},
+    {name:'dispatch_session_task', label:'派发任务', group:'编排'},
+    {name:'orchestrate_task', label:'自动编排', group:'编排'},
+    {name:'todo_list_create', label:'创建清单', group:'任务'},
+    {name:'todo_list_update', label:'更新清单', group:'任务'},
+    {name:'todo_list_read', label:'读取清单', group:'任务'},
+  ];
+  const toolPermModal = document.getElementById('toolPermModal');
+  const toolPermGrid = document.getElementById('toolPermGrid');
+  const toolPermRoleName = document.getElementById('toolPermRoleName');
+  const toolPermStatus = document.getElementById('toolPermStatus');
+  const btnToolPerm = document.getElementById('btnToolPerm');
+  if (btnToolPerm) {
+    btnToolPerm.addEventListener('click', () => {
+      vscode.postMessage({ type: 'openToolPermissions' });
+    });
+  }
+  document.getElementById('toolPermClose').addEventListener('click', () => {
+    toolPermModal.classList.remove('show');
+  });
+  function renderToolPermGrid(allowedSet, deniedSet) {
+    const groups = {};
+    TOOL_LIST.forEach(t => { (groups[t.group] = groups[t.group] || []).push(t); });
+    toolPermGrid.innerHTML = Object.entries(groups).map(([groupLabel, tools]) => {
+      const rows = tools.map(t => {
+        const isAllowed = allowedSet.has(t.name);
+        const isDenied = deniedSet.has(t.name);
+        return '<div class="tool-perm-row" style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;">' +
+          '<span style="font-size:12px;" title="' + t.name + '">' + t.label + '</span>' +
+          '<div style="display:flex;gap:4px;">' +
+            '<span class="tool-perm-btn allow' + (isAllowed ? ' active' : '') + '" data-allow="' + t.name + '" style="padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--border);' + (isAllowed ? 'background:var(--accent-dim);color:var(--accent);border-color:var(--accent);' : '') + '">允许</span>' +
+            '<span class="tool-perm-btn deny' + (isDenied ? ' active' : '') + '" data-deny="' + t.name + '" style="padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--border);' + (isDenied ? 'background:rgba(239,68,68,0.15);color:var(--danger);border-color:var(--danger);' : '') + '">禁止</span>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+      return '<div style="margin-bottom:10px;"><div style="font-size:11px;font-weight:600;color:var(--text-secondary);text-transform:uppercase;margin-bottom:4px;">' + groupLabel + '</div>' + rows + '</div>';
+    }).join('');
+    // toggle events
+    toolPermGrid.querySelectorAll('.tool-perm-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const isAllow = btn.classList.contains('allow');
+        if (isAllow) {
+          btn.classList.toggle('active');
+          if (btn.classList.contains('active')) {
+            btn.style.cssText = 'padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--accent);background:var(--accent-dim);color:var(--accent);';
+          } else {
+            btn.style.cssText = 'padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--border);';
+          }
+          // 禁止取消
+          const denyBtn = btn.parentElement.querySelector('.deny.active');
+          if (denyBtn && btn.classList.contains('active')) {
+            denyBtn.classList.remove('active');
+            denyBtn.style.cssText = 'padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--border);';
+          }
+        } else {
+          btn.classList.toggle('active');
+          if (btn.classList.contains('active')) {
+            btn.style.cssText = 'padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--danger);background:rgba(239,68,68,0.15);color:var(--danger);';
+          } else {
+            btn.style.cssText = 'padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--border);';
+          }
+          // 允许取消
+          const allowBtn = btn.parentElement.querySelector('.allow.active');
+          if (allowBtn && btn.classList.contains('active')) {
+            allowBtn.classList.remove('active');
+            allowBtn.style.cssText = 'padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid var(--border);';
+          }
+        }
+      });
+    });
+  }
+  document.getElementById('toolPermSave').addEventListener('click', () => {
+    const allowedTools = Array.from(toolPermGrid.querySelectorAll('.tool-perm-btn.allow.active')).map(el => el.dataset.allow);
+    const deniedTools = Array.from(toolPermGrid.querySelectorAll('.tool-perm-btn.deny.active')).map(el => el.dataset.deny);
+    toolPermStatus.textContent = '保存中…';
+    vscode.postMessage({ type: 'updateToolPermissions', allowedTools, deniedTools });
+  });
+
+  // ====== 工具审批弹窗 ======
+  const approvalModal = document.getElementById('approvalModal');
+  const approvalTitle = document.getElementById('approvalTitle');
+  const approvalDetail = document.getElementById('approvalDetail');
+  const approvalRemember = document.getElementById('approvalRemember');
+  let currentApprovalId = null;
+  let currentApprovalToolName = '';
+  document.getElementById('approvalApprove').addEventListener('click', () => {
+    if (!currentApprovalId) return;
+    const remember = approvalRemember.checked;
+    if (remember && currentApprovalToolName) {
+      vscode.postMessage({ type: 'toolApprovalResponse', approvalId: currentApprovalId, approved: true, remember: true, toolName: currentApprovalToolName });
+    } else {
+      vscode.postMessage({ type: 'toolApprovalResponse', approvalId: currentApprovalId, approved: true, remember: false });
+    }
+    approvalModal.classList.remove('show');
+    currentApprovalId = null;
+  });
+  document.getElementById('approvalDenyBtn').addEventListener('click', () => {
+    if (!currentApprovalId) return;
+    vscode.postMessage({ type: 'toolApprovalResponse', approvalId: currentApprovalId, approved: false });
+    approvalModal.classList.remove('show');
+    currentApprovalId = null;
+  });
+  document.getElementById('approvalDeny').addEventListener('click', () => {
+    if (!currentApprovalId) return;
+    vscode.postMessage({ type: 'toolApprovalResponse', approvalId: currentApprovalId, approved: false });
+    approvalModal.classList.remove('show');
+    currentApprovalId = null;
+  });
+
   // ====== 接收扩展消息 ======
   window.addEventListener('message', (e) => {
     const msg = e.data;
     switch (msg.type) {
+      case 'workspaceFiles':
+        if (Array.isArray(msg.files)) workspaceFiles = msg.files;
+        break;
       case 'historyLoaded': {
         autoFollowOutput = true;
         window._currentRoleName = msg.role ? msg.role.name : 'AI';
@@ -1779,6 +2402,9 @@ export class ChatPanel {
         appendMessage('user', msg.content, new Date().toISOString());
         scrollBottom(true);
         break;
+      case 'modeIndicator':
+        appendMessage('system', '📋 ' + msg.mode, new Date().toISOString());
+        break;
       case 'streamStart':
         setStreaming(true);
         autoFollowOutput = true;
@@ -1789,13 +2415,14 @@ export class ChatPanel {
         break;
       case 'reasoningChunk': {
         if (currentAssistantEl) {
-          const reasoning = ensureReasoningPanel(currentAssistantEl);
-          const followReasoning = reasoning.scrollHeight - reasoning.scrollTop - reasoning.clientHeight <= 48;
-          const raw = reasoning.getAttribute('data-raw') || '';
+          const panel = ensureReasoningPanel(currentAssistantEl);
+          const content = panel.querySelector('.reasoning-content');
+          const followReasoning = content.scrollHeight - content.scrollTop - content.clientHeight <= 48;
+          const raw = content.getAttribute('data-raw') || '';
           const newText = raw + msg.delta;
-          reasoning.setAttribute('data-raw', newText);
-          reasoning.textContent = newText;
-          if (followReasoning) reasoning.scrollTop = reasoning.scrollHeight;
+          content.setAttribute('data-raw', newText);
+          content.textContent = newText;
+          if (followReasoning) content.scrollTop = content.scrollHeight;
           scrollBottom(false);
         }
         break;
@@ -1811,15 +2438,28 @@ export class ChatPanel {
         break;
       }
       case 'toolStatus': {
-        const labels = { running: '正在调用工具', completed: '工具调用完成', failed: '工具调用失败' };
         const toolKey = msg.callId || msg.name || '';
-        currentToolStatusEl = toolStatusElements.get(toolKey) || null;
-        if (!currentToolStatusEl) {
-          currentToolStatusEl = appendMessage('system', '', new Date().toISOString());
-          currentToolStatusEl.setAttribute('data-tool-key', toolKey);
-          toolStatusElements.set(toolKey, currentToolStatusEl);
+        if (!currentAssistantEl) break;
+        const badges = ensureToolBadges(currentAssistantEl);
+        let badge = toolStatusElements.get(toolKey);
+        if (!badge) {
+          badge = document.createElement('span');
+          badge.className = 'tool-badge running';
+          badge.setAttribute('data-tool-key', toolKey);
+          badges.appendChild(badge);
+          toolStatusElements.set(toolKey, badge);
         }
-        currentToolStatusEl.textContent = (labels[msg.status] || '工具状态') + ': ' + (msg.name || 'unknown') + (msg.status === 'failed' && msg.detail ? ' - ' + msg.detail : '');
+        const toolLabel = msg.name || 'unknown';
+        if (msg.status === 'running') {
+          badge.className = 'tool-badge running';
+          badge.textContent = toolLabel;
+        } else if (msg.status === 'completed') {
+          badge.className = 'tool-badge completed';
+          badge.textContent = toolLabel;
+        } else if (msg.status === 'failed') {
+          badge.className = 'tool-badge failed';
+          badge.textContent = toolLabel + (msg.detail ? ' — ' + msg.detail : '');
+        }
         scrollBottom(false);
         break;
       }
@@ -1831,9 +2471,13 @@ export class ChatPanel {
           if (msg.fullText) {
             currentAssistantEl.innerHTML = renderMarkdown(msg.fullText);
             if (msg.reasoningText) {
-              const reasoning = ensureReasoningPanel(currentAssistantEl);
-              reasoning.removeAttribute('data-raw');
-              reasoning.textContent = msg.reasoningText;
+              const panel = ensureReasoningPanel(currentAssistantEl);
+              panel.classList.remove('is-streaming');
+              panel.querySelector('summary').textContent = '思考过程';
+              const content = panel.querySelector('.reasoning-content');
+              content.classList.remove('is-streaming');
+              content.removeAttribute('data-raw');
+              content.textContent = msg.reasoningText;
             }
           } else {
             currentAssistantEl.textContent = msg.aborted ? '(已中断)' : '(已完成，无文本回复)';
@@ -1850,9 +2494,13 @@ export class ChatPanel {
           currentAssistantEl.removeAttribute('data-raw');
           currentAssistantEl.innerHTML = msg.fullText ? renderMarkdown(msg.fullText) : '(生成失败)';
           if (msg.reasoningText) {
-            const reasoning = ensureReasoningPanel(currentAssistantEl);
-            reasoning.removeAttribute('data-raw');
-            reasoning.textContent = msg.reasoningText;
+            const panel = ensureReasoningPanel(currentAssistantEl);
+            panel.classList.remove('is-streaming');
+            panel.querySelector('summary').textContent = '思考过程';
+            const content = panel.querySelector('.reasoning-content');
+            content.classList.remove('is-streaming');
+            content.removeAttribute('data-raw');
+            content.textContent = msg.reasoningText;
           }
           currentAssistantEl = null;
           currentToolStatusEl = null;
@@ -1876,6 +2524,24 @@ export class ChatPanel {
         break;
       case 'contextUsage':
         updateContextUsage(msg);
+        break;
+      case 'toolPermissionsData':
+        toolPermRoleName.textContent = msg.roleName || '';
+        renderToolPermGrid(new Set(msg.allowedTools || []), new Set(msg.deniedTools || []));
+        toolPermStatus.textContent = '';
+        toolPermModal.classList.add('show');
+        break;
+      case 'toolPermissionsSaved':
+        toolPermStatus.textContent = '✅ 已保存，当前会话立即生效';
+        setTimeout(() => { toolPermModal.classList.remove('show'); }, 600);
+        break;
+      case 'toolApprovalRequest':
+        currentApprovalId = msg.approvalId;
+        currentApprovalToolName = msg.toolName || '';
+        approvalTitle.textContent = msg.title || '⚠️ 工具审批';
+        approvalDetail.textContent = msg.detail || '';
+        approvalRemember.checked = false;
+        approvalModal.classList.add('show');
         break;
     }
   });
