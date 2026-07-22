@@ -42,15 +42,21 @@ npm run mcp
 - **任务中心** — 查看和验收跨会话派发的任务
 - **模型管理** — 配置 OpenAI 兼容 API（Key、BaseURL、模型、温度等），支持多预设
 - **内置 15 个角色** — Vue/React/Go/Java/PHP/Python/Rust/测试/代码审计/产品/UI/Agent 简报等，开箱即用
+- **自动编排** — 复杂任务自动拆解为子任务，按依赖图拓扑序分配给合适角色执行并汇总结果
+- **代码库语义搜索** — 基于 embedding 的向量搜索，自然语言查找代码位置
+- **检查点回滚** — 影子 Git 仓库自动快照，支持文件级回滚
+- **MCP Server 集成** — 连接外部 MCP Server，扩展工具能力
+- **Todo List** — 单会话多步任务跟踪，LLM 自管理进度
+- **Slash Commands** — `/code`、`/ask`、`/debug`、`/architect` 快速切换模式
 
 ### 安装
 
 **方式一：从 VSIX 安装（推荐）**
 
-1. 从 [GitHub Releases](https://github.com/Leesin596/ai-agent-coordinator/releases) 下载 `ai-agent-coordinator-0.1.1.vsix`
+1. 从 [GitHub Releases](https://github.com/Leesin596/ai-agent-coordinator/releases) 下载 `ai-agent-coordinator-0.2.0.vsix`
 2. 在 VS Code 中执行：
    ```
-   code --install-extension ai-agent-coordinator-0.1.1.vsix
+   code --install-extension ai-agent-coordinator-0.2.0.vsix
    ```
 3. 重载窗口（`Ctrl+Shift+P` → `Developer: Reload Window`）
 4. 左侧活动栏出现 Coordinator 图标，点击即可使用
@@ -64,7 +70,7 @@ npm run build
 # 打包 VSIX
 npx vsce package --no-git-tag-version
 # 安装
-code --install-extension ai-agent-coordinator-0.1.1.vsix
+code --install-extension ai-agent-coordinator-0.2.0.vsix
 ```
 
 ### 配置 LLM
