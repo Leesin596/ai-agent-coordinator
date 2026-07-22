@@ -1,5 +1,5 @@
 import type { LLMMessage } from '../llm-service';
-import type { ParsedStreamData } from '../llm-api';
+import type { ParsedStreamData, TokenUsage } from '../llm-api';
 import type { LLMProvider, ProviderRequestConfig, PreparedRequest } from './base-provider';
 import { extractText, normalizeReasoningEffort, supportsOpenAIReasoningControls as supportsReasoningControls } from './provider-utils';
 
@@ -67,7 +67,25 @@ export class ResponsesProvider implements LLMProvider {
       if (json.type === 'response.incomplete') {
         return { error: `模型输出未完成: ${json.response?.incomplete_details?.reason || '未知原因'}` };
       }
-      if (json.type === 'response.completed') return { done: true };
+      if (json.type === 'response.completed') {
+        const usage = json.response?.usage;
+        if (usage) {
+          const promptTokens = Number(usage.input_tokens) || 0;
+          const completionTokens = Number(usage.output_tokens) || 0;
+          if (promptTokens || completionTokens) {
+            return {
+              done: true,
+              usage: {
+                promptTokens,
+                completionTokens,
+                totalTokens: Number(usage.total_tokens) || promptTokens + completionTokens,
+                cacheHitTokens: Number(usage.input_tokens_details?.cached_tokens) || undefined,
+              },
+            };
+          }
+        }
+        return { done: true };
+      }
       if (json.type === 'response.output_item.done' && json.item) return { outputItem: json.item };
       if (json.type === 'response.output_text.delta') return { textDelta: extractText(json.delta) };
       if (json.type === 'response.reasoning_summary_text.delta' || json.type === 'response.reasoning_text.delta') {

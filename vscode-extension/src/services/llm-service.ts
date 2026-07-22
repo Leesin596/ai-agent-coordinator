@@ -10,8 +10,9 @@
 //   chat                 — Promise 版，包装 streamChat
 // ============================================================
 import type { ModelApiFormat } from './model-store';
-import type { LLMToolDefinition } from './llm-api';
+import type { LLMToolDefinition, TokenUsage } from './llm-api';
 import { createProvider, type ProviderRequestConfig } from './providers';
+import { trimPreviousToolResults } from './context-manager';
 
 export interface LLMToolCall {
   id: string;
@@ -45,7 +46,26 @@ export interface LLMConfig {
 }
 
 export function estimateMessageTokens(messages: Array<{ content: string }>): number {
-  return messages.reduce((total, message) => total + Math.ceil(message.content.length / 4), 0);
+  return messages.reduce((total, message) => total + estimateTextTokens(message.content), 0);
+}
+
+/**
+ * 估算文本的 token 数。
+ * CJK 字符 ≈ 1.5 tokens/字，ASCII ≈ 0.25 tokens/char (4 chars/token)。
+ * 混合内容按字符类型分别计算后求和。
+ */
+export function estimateTextTokens(text: string): number {
+  if (!text) return 0;
+  let cjkCount = 0;
+  let asciiCount = 0;
+  for (const ch of text) {
+    if (/[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af]/.test(ch)) {
+      cjkCount++;
+    } else {
+      asciiCount++;
+    }
+  }
+  return Math.ceil(cjkCount * 1.5 + asciiCount / 4);
 }
 
 export interface LLMStreamCallbacks {
@@ -54,7 +74,7 @@ export interface LLMStreamCallbacks {
   onToolCall?: (call: LLMToolCall) => Promise<string>;
   onToolStatus?: (call: LLMToolCall, status: 'running' | 'completed' | 'failed', detail?: string) => void;
   onToolEvent?: (call: LLMToolCall, result?: string) => void;
-  onDone: (fullText: string, reasoningText: string) => void;
+  onDone: (fullText: string, reasoningText: string, usage?: TokenUsage) => void;
   onError: (err: Error, fullText: string, reasoningText: string) => void;
 }
 
@@ -85,12 +105,24 @@ export type StreamChunk =
   | { type: 'toolCall'; call: LLMToolCall }
   | { type: 'toolResult'; call: LLMToolCall; result: string }
   | { type: 'toolStatus'; call: LLMToolCall; status: 'running' | 'completed' | 'failed'; detail?: string }
-  | { type: 'done'; fullText: string; reasoningText: string }
+  | { type: 'done'; fullText: string; reasoningText: string; usage?: TokenUsage }
   | { type: 'error'; error: Error; fullText: string; reasoningText: string };
 
 export interface StreamGeneratorOptions {
   toolExecutor?: (call: LLMToolCall) => Promise<string>;
   abortController?: AbortController;
+}
+
+/** 合并多次 partial usage（Anthropic 流式分 message_start 和 message_delta 两次返回） */
+function mergeUsage(prev: TokenUsage | undefined, next: TokenUsage): TokenUsage {
+  if (!prev) return next;
+  return {
+    promptTokens: next.promptTokens || prev.promptTokens,
+    completionTokens: next.completionTokens || prev.completionTokens,
+    totalTokens: next.totalTokens || prev.totalTokens,
+    cacheHitTokens: next.cacheHitTokens ?? prev.cacheHitTokens,
+    cacheMissTokens: next.cacheMissTokens ?? prev.cacheMissTokens,
+  };
 }
 
 interface RoundContext {
@@ -99,6 +131,7 @@ interface RoundContext {
   previousToolCallSignature: string | null;
   consecutiveIdenticalCount: number;
   aborted: boolean;
+  usage: TokenUsage | undefined;
 }
 
 interface RoundResult {
@@ -142,13 +175,14 @@ export class LLMService {
       previousToolCallSignature: null,
       consecutiveIdenticalCount: 0,
       aborted: false,
+      usage: undefined,
     };
     const isAborted = (): boolean => ctx.aborted || controller.signal.aborted;
 
     try {
       yield* this.runRounds(messages, provider, providerConfig, toolExecutor, controller, ctx, isAborted);
       if (!isAborted()) {
-        yield { type: 'done', fullText: ctx.fullText, reasoningText: ctx.reasoningText };
+        yield { type: 'done', fullText: ctx.fullText, reasoningText: ctx.reasoningText, usage: ctx.usage };
       }
     } catch (err) {
       if (isAborted()) return;
@@ -272,7 +306,10 @@ export class LLMService {
         }
       }
 
-      roundMessages = nextMessages;
+      // P0: 截短之前轮次的工具结果，防止多轮工具调用上下文膨胀
+      const currentRoundStart = roundMessages.length;
+      const { messages: trimmedMessages } = trimPreviousToolResults(nextMessages, currentRoundStart);
+      roundMessages = trimmedMessages;
       round++;
     }
   }
@@ -359,6 +396,7 @@ export class LLMService {
             }
             if (parsed.reasoningSignatureDelta) reasoningSignature += parsed.reasoningSignatureDelta;
             if (parsed.outputItem) providerItems.push(parsed.outputItem);
+            if (parsed.usage) ctx.usage = mergeUsage(ctx.usage, parsed.usage);
 
             if (parsed.textDelta) {
               roundText += parsed.textDelta;
@@ -400,6 +438,7 @@ export class LLMService {
             ctx.fullText += parsed.textDelta;
             yield { type: 'text', delta: parsed.textDelta };
           }
+          if (parsed.usage) ctx.usage = mergeUsage(ctx.usage, parsed.usage);
         }
 
         const allToolCalls = [...pendingCalls.entries()]
@@ -475,7 +514,7 @@ export class LLMService {
               callbacks.onToolEvent?.(chunk.call, chunk.result);
               break;
             case 'done':
-              callbacks.onDone(chunk.fullText, chunk.reasoningText);
+              callbacks.onDone(chunk.fullText, chunk.reasoningText, chunk.usage);
               break;
             case 'error':
               callbacks.onError(chunk.error, chunk.fullText, chunk.reasoningText);

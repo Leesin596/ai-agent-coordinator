@@ -13,6 +13,7 @@ import { buildWorkspaceContext } from '../services/workspace-context';
 import { WorkspaceToolExecutor, type ToolApprovalRequest } from '../services/workspace-tools';
 import { CheckpointManager } from '../services/checkpoint-manager';
 import { shouldAutoApprove } from '../services/approval-helper';
+import { preflightCompaction, buildFoldSummaryRequest, assembleFoldedMessages, archiveMessages, searchSessionArchive } from '../services/context-manager';
 import { TerminalService } from '../services/terminal-service';
 import {
   buildSessionContextPackage,
@@ -310,12 +311,50 @@ export class ChatPanel {
       }
     }
 
-    this.sendContextUsage(messages, config.contextWindow);
+    // P1+P2: preflight 分级压缩 — 发送前检查上下文占比，按需截短/fold
+    const preflight = preflightCompaction(messages, config.contextWindow || 128000);
+    let compactedMessages = preflight.messages;
+
+    // P2: force-fold 时调用 LLM 摘要历史
+    if (preflight.level === 'force-fold' && preflight.foldBoundary) {
+      // P3: 先归档将被压缩的 head 消息
+      archiveMessages(this.runtime.workspace.folderPath, this.session.id, preflight.foldBoundary.head, 'fold');
+      this.sendToWebview({
+        type: 'systemMessage',
+        content: `📦 上下文压缩 (${Math.round(preflight.ratio * 100)}%): 正在生成历史摘要…`,
+      });
+      try {
+        const summaryMessages = buildFoldSummaryRequest(preflight.foldBoundary.head);
+        const summary = await this.llm.chat(summaryMessages, {
+          ...config,
+          temperature: 0.3,
+          maxTokens: 2000,
+          tools: undefined,
+        });
+        compactedMessages = assembleFoldedMessages(summary, preflight.foldBoundary.tail);
+        this.sendToWebview({
+          type: 'systemMessage',
+          content: `📦 上下文 fold 完成: head ${preflight.foldBoundary.headTokens} tokens → 摘要，tail ${preflight.foldBoundary.tailTokens} tokens 保留`,
+        });
+      } catch (err: any) {
+        this.sendToWebview({
+          type: 'systemMessage',
+          content: `⚠️ 上下文 fold 失败: ${err.message}，降级为 prune`,
+        });
+      }
+    } else if (preflight.level !== 'none') {
+      this.sendToWebview({
+        type: 'systemMessage',
+        content: `📦 上下文压缩 (${Math.round(preflight.ratio * 100)}%): snip=${preflight.snippedCount} prune=${preflight.prunedCount}`,
+      });
+    }
+
+    this.sendContextUsage(compactedMessages, config.contextWindow);
     this.toolExecutor.begin();
 
     let usedNativeTool = false;
     const roleFilteredTools = filterToolsByRole(COORDINATOR_LLM_TOOLS, this.role);
-    this.abortFn = this.llm.streamChat(messages, { ...config, tools: roleFilteredTools }, {
+    this.abortFn = this.llm.streamChat(compactedMessages, { ...config, tools: roleFilteredTools }, {
       onChunk: (delta) => {
         this.sendToWebview({ type: 'streamChunk', delta });
       },
@@ -329,13 +368,17 @@ export class ChatPanel {
       onToolStatus: (call, status, detail) => {
         this.sendToWebview({ type: 'toolStatus', callId: call.id, name: call.name, status, detail });
       },
-      onDone: (fullText, reasoningText) => {
+      onDone: (fullText, reasoningText, usage) => {
         this.isStreaming = false;
         this.abortFn = null;
         if (fullText) this.runtime.sessionManager.addMessage(this.session.id, 'assistant', fullText);
         this.sendToWebview({ type: 'streamEnd', fullText, reasoningText });
         // 从 DB 重新读取消息（包含刚写入的 assistant 回复），并重建 workspace context
         this.sendToWebview({ type: 'contextUsage', ...this.getFullContextUsage() });
+        // 发送 API 返回的真实 token 用量（如有）
+        if (usage) {
+          this.sendToWebview({ type: 'tokenUsage', usage });
+        }
         // 自动解析并执行派发指令
         if (!usedNativeTool) this.parseAndDispatch(fullText);
       },
@@ -413,6 +456,12 @@ export class ChatPanel {
       }
       return this.executeOrchestrateTask(call);
     }
+    if (call.name === 'history_search') {
+      if (!isToolAllowedByRole(call.name, this.role)) {
+        throw new Error(`角色「${this.role?.name || '未知'}」无权使用工具: ${call.name}`);
+      }
+      return this.executeHistorySearch(call);
+    }
     if (call.name !== 'dispatch_session_task') {
       if (!isToolAllowedByRole(call.name, this.role)) {
         throw new Error(`角色「${this.role.name}」无权使用工具: ${call.name}`);
@@ -439,6 +488,38 @@ export class ChatPanel {
       throw new Error('工具参数超过允许长度');
     }
     return JSON.stringify({ ok: true, ...this.dispatchSessionTask(block) });
+  }
+
+  private async executeHistorySearch(call: LLMToolCall): Promise<string> {
+    let input: unknown;
+    try {
+      input = JSON.parse(call.arguments || '{}');
+    } catch {
+      throw new Error('工具参数不是有效的 JSON');
+    }
+    if (!input || typeof input !== 'object') throw new Error('工具参数必须是对象');
+    const values = input as Record<string, unknown>;
+    const query = typeof values.query === 'string' ? values.query.trim() : '';
+    if (!query) throw new Error('query 为必填字符串');
+    const topK = typeof values.topK === 'number' && values.topK >= 1 && values.topK <= 20
+      ? Math.floor(values.topK)
+      : 5;
+
+    const results = searchSessionArchive(this.runtime.workspace.folderPath, this.session.id, query, topK);
+    if (results.length === 0) {
+      return JSON.stringify({ ok: true, results: [], message: '未找到匹配的归档历史消息' });
+    }
+    return JSON.stringify({
+      ok: true,
+      results: results.map((r) => ({
+        role: r.role,
+        score: Math.round(r.score * 100) / 100,
+        content: r.content.length > 2000
+          ? `${r.content.slice(0, 1200)}\n[…省略…]\n${r.content.slice(-800)}`
+          : r.content,
+        archivedAt: r.archivedAt,
+      })),
+    });
   }
 
   private async executeOrchestrateTask(call: LLMToolCall): Promise<string> {
@@ -829,7 +910,7 @@ export class ChatPanel {
             model: preset.model,
             apiFormat: preset.apiFormat,
             temperature: preset.temperature ?? 0.7,
-            contextWindow: preset.contextWindow ?? 1000000,
+            contextWindow: preset.contextWindow ?? 128000,
             thinkingStrength: preset.thinkingStrength ?? 'xhigh',
             apiKeyRequired: preset.apiKeyRequired,
           };
@@ -845,7 +926,7 @@ export class ChatPanel {
         model: def.model,
         apiFormat: def.apiFormat,
         temperature: def.temperature ?? 0.7,
-        contextWindow: def.contextWindow ?? 1000000,
+        contextWindow: def.contextWindow ?? 128000,
         thinkingStrength: def.thinkingStrength ?? 'xhigh',
         apiKeyRequired: def.apiKeyRequired,
       };
@@ -858,12 +939,12 @@ export class ChatPanel {
       model: globalCfg.get<string>('model', 'gpt-4o-mini'),
       apiFormat: 'chat-completions',
       temperature: globalCfg.get<number>('temperature', 0.7),
-      contextWindow: 1000000,
+      contextWindow: 128000,
       thinkingStrength: 'xhigh',
     };
   }
 
-  private getContextUsage(messages: Array<{ content: string }>, contextWindow = 1000000): { used: number; limit: number; percent: number } {
+  private getContextUsage(messages: Array<{ content: string }>, contextWindow = 128000): { used: number; limit: number; percent: number } {
     const limit = Math.max(1, contextWindow);
     const used = estimateMessageTokens(messages);
     return { used, limit, percent: Math.min(100, Math.round((used / limit) * 100)) };
@@ -890,7 +971,7 @@ export class ChatPanel {
     return this.getContextUsage(messages, config.contextWindow);
   }
 
-  private sendContextUsage(messages: Array<{ content: string }>, contextWindow = 1000000): void {
+  private sendContextUsage(messages: Array<{ content: string }>, contextWindow = 128000): void {
     this.sendToWebview({ type: 'contextUsage', ...this.getContextUsage(messages, contextWindow) });
   }
 
@@ -1787,7 +1868,8 @@ export class ChatPanel {
         ⇄<span class="tooltip">上下文对齐</span>
       </button>
       <div class="toolbar-spacer"></div>
-      <span class="context-usage" id="contextUsage" title="当前会话上下文估算占用">上下文 0 / 1M · 0%</span>
+      <span class="context-usage" id="contextUsage" title="当前会话上下文估算占用">上下文 0 / 128K · 0%</span>
+      <span class="token-usage" id="tokenUsage" title="API 返回的真实 token 用量" style="display:none;font-size:11px;color:var(--text3);"></span>
       <span class="timer-display" id="timerDisplay">00:00:00</span>
     </div>
 
@@ -1922,6 +2004,25 @@ export class ChatPanel {
     el.style.cursor = 'pointer';
     el.classList.toggle('warn', usage.percent >= 70 && usage.percent < 90);
     el.classList.toggle('danger', usage.percent >= 90);
+  }
+
+  function updateTokenUsage(usage) {
+    if (!usage) return;
+    const el = document.getElementById('tokenUsage');
+    if (!el) return;
+    const parts = [];
+    parts.push('↑' + formatTokens(usage.promptTokens));
+    parts.push('↓' + formatTokens(usage.completionTokens));
+    if (usage.cacheHitTokens != null && usage.cacheHitTokens > 0) {
+      const totalInput = usage.cacheHitTokens + (usage.cacheMissTokens || 0);
+      const hitRate = totalInput > 0 ? Math.round(usage.cacheHitTokens / totalInput * 100) : 0;
+      parts.push('cache ' + hitRate + '%');
+    }
+    el.textContent = parts.join(' · ');
+    el.title = 'API 返回真实用量\\n输入: ' + usage.promptTokens.toLocaleString() + ' tokens\\n输出: ' + usage.completionTokens.toLocaleString() + ' tokens' +
+      (usage.cacheHitTokens != null ? '\\n缓存命中: ' + usage.cacheHitTokens.toLocaleString() + ' tokens' : '') +
+      (usage.cacheMissTokens != null ? '\\n缓存未命中: ' + usage.cacheMissTokens.toLocaleString() + ' tokens' : '');
+    el.style.display = '';
   }
 
   // ====== 标签栏管理 ======
@@ -2389,6 +2490,7 @@ export class ChatPanel {
 
         // 更新角色信息
         messagesEl.innerHTML = '';
+        currentAssistantEl = null;
 
         if (msg.messages && msg.messages.length > 0) {
           msg.messages.forEach(m => {
@@ -2400,6 +2502,11 @@ export class ChatPanel {
           });
         } else {
           messagesEl.innerHTML = '<div class="empty-state"><div class="empty-icon">💬</div><div class="empty-text">开始与 AI 角色对话</div><div class="empty-hint">输入消息，按 Enter 发送 · Shift+Enter 换行</div></div>';
+        }
+        // 如果正在 streaming，重建 streaming 气泡
+        if (isStreaming) {
+          currentAssistantEl = appendMessage('assistant', '', new Date().toISOString());
+          currentAssistantEl.classList.add('streaming-cursor');
         }
         scrollBottom(true);
         break;
@@ -2531,6 +2638,9 @@ export class ChatPanel {
         break;
       case 'contextUsage':
         updateContextUsage(msg);
+        break;
+      case 'tokenUsage':
+        updateTokenUsage(msg.usage);
         break;
       case 'toolPermissionsData':
         toolPermRoleName.textContent = msg.roleName || '';

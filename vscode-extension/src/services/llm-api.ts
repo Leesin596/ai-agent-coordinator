@@ -250,7 +250,31 @@ export const COORDINATOR_LLM_TOOLS: LLMToolDefinition[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'history_search',
+    description: '搜索当前会话被上下文压缩归档的历史消息。当对话较长、早期内容被自动压缩后，可用此工具检索之前讨论过的关键信息、决策或代码片段。使用自然语言关键词搜索。',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '搜索关键词或自然语言描述，例如"用户认证方案"或"数据库迁移决策"' },
+        topK: { type: 'integer', minimum: 1, maximum: 20, description: '返回结果数，默认 5' },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+  },
 ];
+
+/** API 返回的真实 token 用量 */
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  /** 缓存命中的 input tokens（DeepSeek prompt_cache_hit_tokens / OpenAI cached_tokens / Anthropic cache_read_input_tokens） */
+  cacheHitTokens?: number;
+  /** 缓存未命中的 input tokens（DeepSeek prompt_cache_miss_tokens） */
+  cacheMissTokens?: number;
+}
 
 export interface ParsedStreamData {
   textDelta?: string;
@@ -258,6 +282,7 @@ export interface ParsedStreamData {
   toolCallDeltas?: LLMToolCallDelta[];
   reasoningSignatureDelta?: string;
   outputItem?: Record<string, unknown>;
+  usage?: TokenUsage;
   done?: boolean;
   error?: string;
 }

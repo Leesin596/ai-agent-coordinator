@@ -1,5 +1,5 @@
 import type { LLMMessage } from '../llm-service';
-import type { LLMToolDefinition, ParsedStreamData } from '../llm-api';
+import type { LLMToolDefinition, ParsedStreamData, TokenUsage } from '../llm-api';
 import type { LLMProvider, ProviderRequestConfig, PreparedRequest } from './base-provider';
 import { extractText, normalizeReasoningEffort } from './provider-utils';
 
@@ -147,6 +147,35 @@ export class AnthropicProvider implements LLMProvider {
       const json = JSON.parse(data);
       if (json.type === 'error') return { error: json.error?.message || 'Anthropic 流式请求失败' };
       if (json.type === 'message_stop') return { done: true };
+      // message_start: input_tokens + cache tokens
+      if (json.type === 'message_start' && json.message?.usage) {
+        const u = json.message.usage;
+        const promptTokens = Number(u.input_tokens) || 0;
+        if (promptTokens) {
+          return {
+            usage: {
+              promptTokens,
+              completionTokens: 0,
+              totalTokens: promptTokens,
+              cacheHitTokens: Number(u.cache_read_input_tokens) || undefined,
+              cacheMissTokens: Number(u.cache_creation_input_tokens) || undefined,
+            },
+          };
+        }
+      }
+      // message_delta: output_tokens (cumulative)
+      if (json.type === 'message_delta' && json.usage) {
+        const completionTokens = Number(json.usage.output_tokens) || 0;
+        if (completionTokens) {
+          return {
+            usage: {
+              promptTokens: 0,
+              completionTokens,
+              totalTokens: completionTokens,
+            },
+          };
+        }
+      }
       if (json.type === 'content_block_start' && json.content_block?.type === 'tool_use') {
         return {
           toolCallDeltas: [{

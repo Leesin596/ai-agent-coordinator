@@ -26,7 +26,6 @@ export class TerminalService {
       this.terminalExitDisposable = null;
     }
     this.terminal = vscode.window.createTerminal({ name: 'Coordinator', cwd });
-    this.terminal.show(true);
     this.terminalExitDisposable = vscode.window.onDidCloseTerminal((closed) => {
       if (closed === this.terminal) {
         this.terminal = null;
@@ -42,7 +41,6 @@ export class TerminalService {
   createRunner(): TerminalRunner {
     return async (command: string, cwd: string, timeoutSeconds: number): Promise<TerminalRunResult> => {
       const terminal = this.ensureTerminal(cwd);
-      terminal.show(true);
 
       const shellIntegration = terminal.shellIntegration;
       if (shellIntegration) {

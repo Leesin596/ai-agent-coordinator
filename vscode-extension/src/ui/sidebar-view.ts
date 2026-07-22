@@ -247,7 +247,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
       model: preset.model?.trim() || 'gpt-5.6-terra',
       apiFormat: (preset.apiFormat || 'responses') as ModelApiFormat,
       thinkingStrength: preset.thinkingStrength || 'xhigh',
-      contextWindow: preset.contextWindow ? Number(preset.contextWindow) : 1000000,
+      contextWindow: preset.contextWindow ? Number(preset.contextWindow) : 128000,
       temperature: preset.temperature !== undefined && preset.temperature !== '' ? Number(preset.temperature) : 0.7,
       apiKeyRequired,
     });
@@ -727,7 +727,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         </div>
         <div class="field">
           <label>上下文窗口 (tokens)</label>
-          <input type="number" id="fContextWindow" placeholder="1000000" value="1000000">
+          <input type="number" id="fContextWindow" placeholder="128000" value="128000">
         </div>
         <div class="field">
           <label>Temperature</label>
@@ -1009,7 +1009,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         return '<div class="model-card' + (isDef ? ' default' : '') + '" data-id="' + esc(m.id) + '" role="button" tabindex="0">' +
           '<div class="card-row"><div class="card-name">' + esc(m.name) + (isDef ? '<span class="default-badge">默认</span>' : '') + '</div></div>' +
           '<div class="card-model">' + esc(m.model) + ' · ' + maskKey(m.apiKey) + '</div>' +
-          '<div class="card-meta">' + esc(normalizeModelFormat(m.apiFormat)) + ' · ' + esc(m.thinkingStrength || 'xhigh') + ' · ' + (m.contextWindow || 1000000) + ' tokens' + '</div>' +
+          '<div class="card-meta">' + esc(normalizeModelFormat(m.apiFormat)) + ' · ' + esc(m.thinkingStrength || 'xhigh') + ' · ' + (m.contextWindow || 128000) + ' tokens' + '</div>' +
           '<div class="card-actions">' +
             (isDef ? '<span class="card-current">当前配置</span>' : '<button class="act-btn set-default" data-act="default" data-id="' + m.id + '">切换使用</button>') +
             '<button class="act-btn danger" data-act="delete" data-id="' + m.id + '">删除</button>' +
@@ -1119,7 +1119,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     $('fModel').value = 'gpt-5.6-terra';
     $('fApiFormat').value = 'responses';
     $('fThinking').value = 'xhigh';
-    $('fContextWindow').value = '1000000';
+    $('fContextWindow').value = '128000';
     $('fTemp').value = '0.7';
     $('testResult').classList.remove('show', 'ok', 'fail');
     $('fName').focus();
@@ -1143,7 +1143,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     $('fModel').value = m.model || '';
     $('fApiFormat').value = normalizeModelFormat(m.apiFormat);
     $('fThinking').value = m.thinkingStrength || 'xhigh';
-    $('fContextWindow').value = String(m.contextWindow || 1000000);
+    $('fContextWindow').value = String(m.contextWindow || 128000);
     $('fTemp').value = m.temperature !== undefined ? String(m.temperature) : '0.7';
     $('testResult').classList.remove('show', 'ok', 'fail');
   }

@@ -1,5 +1,5 @@
 import type { LLMMessage } from '../llm-service';
-import type { ParsedStreamData } from '../llm-api';
+import type { ParsedStreamData, TokenUsage } from '../llm-api';
 import type { LLMProvider, ProviderRequestConfig, PreparedRequest } from './base-provider';
 import { extractText, normalizeReasoningEffort, supportsOpenAIReasoningControls as supportsReasoningControls } from './provider-utils';
 
@@ -24,6 +24,20 @@ function toChatMessages(messages: LLMMessage[]): Array<Record<string, unknown>> 
       } : {}),
     };
   });
+}
+
+function parseChatUsage(usage: any): TokenUsage | undefined {
+  if (!usage || typeof usage !== 'object') return undefined;
+  const promptTokens = Number(usage.prompt_tokens) || 0;
+  const completionTokens = Number(usage.completion_tokens) || 0;
+  if (!promptTokens && !completionTokens) return undefined;
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens: Number(usage.total_tokens) || promptTokens + completionTokens,
+    cacheHitTokens: Number(usage.prompt_cache_hit_tokens) || Number(usage.prompt_tokens_details?.cached_tokens) || undefined,
+    cacheMissTokens: Number(usage.prompt_cache_miss_tokens) || undefined,
+  };
 }
 
 export class ChatCompletionsProvider implements LLMProvider {
@@ -100,6 +114,7 @@ export class ChatCompletionsProvider implements LLMProvider {
           extractText(delta.reasoning_details),
         toolCallDeltas: toolCalls,
         done: Boolean(choice?.finish_reason),
+        usage: parseChatUsage(json.usage),
       };
     } catch {
       return {};

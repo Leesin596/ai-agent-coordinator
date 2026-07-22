@@ -66,7 +66,7 @@ export class ModelStore {
     const preset: ModelPreset = {
       apiFormat: 'chat-completions',
       thinkingStrength: 'xhigh',
-      contextWindow: 1000000,
+      contextWindow: 128000,
       ...input,
       id: randomUUID(),
       createdAt: new Date().toISOString(),

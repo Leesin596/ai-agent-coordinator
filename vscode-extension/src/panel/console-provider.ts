@@ -19,6 +19,7 @@ import { TodoListManager } from '../services/todo-list-manager';
 import { EmbeddingService } from '../services/embedding-service';
 import { IndexingService } from '../services/indexing-service';
 import { shouldAutoApprove } from '../services/approval-helper';
+import { preflightCompaction, buildFoldSummaryRequest, assembleFoldedMessages, archiveMessages, searchSessionArchive } from '../services/context-manager';
 import { TerminalService } from '../services/terminal-service';
 import {
   buildSessionContextPackage,
@@ -566,7 +567,50 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    this.postContextUsage(sessionId, messages, config.contextWindow);
+    // P1+P2: preflight 分级压缩 — 发送前检查上下文占比，按需截短/fold
+    const preflight = preflightCompaction(messages as LLMMessage[], config.contextWindow || 128000);
+    let compactedMessages = preflight.messages as any[];
+
+    // P2: force-fold 时调用 LLM 摘要历史
+    if (preflight.level === 'force-fold' && preflight.foldBoundary) {
+      // P3: 先归档将被压缩的 head 消息
+      archiveMessages(runtime.workspace.folderPath, sessionId, preflight.foldBoundary.head, 'fold');
+      this.postToWebview({
+        type: 'systemMessage',
+        sessionId,
+        content: `📦 上下文压缩 (${Math.round(preflight.ratio * 100)}%): 正在生成历史摘要…`,
+      });
+      try {
+        const summaryMessages = buildFoldSummaryRequest(preflight.foldBoundary.head);
+        const summary = await this.llm.chat(summaryMessages, {
+          ...config,
+          temperature: 0.3,
+          maxTokens: 2000,
+          tools: undefined,
+        });
+        compactedMessages = assembleFoldedMessages(summary, preflight.foldBoundary.tail) as any[];
+        this.postToWebview({
+          type: 'systemMessage',
+          sessionId,
+          content: `📦 上下文 fold 完成: head ${preflight.foldBoundary.headTokens} tokens → 摘要，tail ${preflight.foldBoundary.tailTokens} tokens 保留`,
+        });
+      } catch (err: any) {
+        // 摘要失败时降级为 prune 后的消息
+        this.postToWebview({
+          type: 'systemMessage',
+          sessionId,
+          content: `⚠️ 上下文 fold 失败: ${err.message}，降级为 prune`,
+        });
+      }
+    } else if (preflight.level !== 'none') {
+      this.postToWebview({
+        type: 'systemMessage',
+        sessionId,
+        content: `📦 上下文压缩 (${Math.round(preflight.ratio * 100)}%): snip=${preflight.snippedCount} prune=${preflight.prunedCount}`,
+      });
+    }
+
+    this.postContextUsage(sessionId, compactedMessages, config.contextWindow);
     tab.toolExecutor.begin();
 
     let usedNativeTool = false;
@@ -574,7 +618,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     const mcpTools = this.mcpManager?.getToolDefinitions() || [];
     const roleFilteredTools = filterToolsByRole(COORDINATOR_LLM_TOOLS, tab.role);
     const allTools = [...roleFilteredTools, ...mcpTools];
-    const abortFn = this.llm.streamChat(messages, { ...config, tools: allTools }, {
+    const abortFn = this.llm.streamChat(compactedMessages, { ...config, tools: allTools }, {
       onChunk: (delta) => {
         this.postToWebview({ type: 'streamChunk', sessionId, delta });
       },
@@ -592,13 +636,17 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       onToolStatus: (call, status, detail) => {
         this.postToWebview({ type: 'toolStatus', sessionId, callId: call.id, name: call.name, status, detail });
       },
-      onDone: (fullText, reasoningText) => {
+      onDone: (fullText, reasoningText, usage) => {
         if (fullText) runtime.sessionManager.addMessage(sessionId, 'assistant', fullText);
         tab.streaming = false;
         tab.abortFn = null;
         this.postToWebview({ type: 'streamEnd', sessionId, fullText, reasoningText });
         // 从 DB 重新读取消息（包含刚写入的 assistant 回复），并重建 workspace context
         this.postToWebview({ type: 'contextUsage', sessionId, ...this.getFullContextUsage(sessionId) });
+        // 发送 API 返回的真实 token 用量（如有）
+        if (usage) {
+          this.postToWebview({ type: 'tokenUsage', sessionId, usage });
+        }
         // 自动解析并执行派发指令
         if (!usedNativeTool) this.parseAndDispatch(runtime, sessionId, fullText);
       },
@@ -683,6 +731,13 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       }
       return this.executeOrchestrateTask(runtime, sourceSessionId, call);
     }
+    if (call.name === 'history_search') {
+      const tab = this.tabs.get(sourceSessionId);
+      if (tab && !isToolAllowedByRole(call.name, tab.role)) {
+        throw new Error(`角色「${tab.role.name}」无权使用工具: ${call.name}`);
+      }
+      return this.executeHistorySearch(runtime, sourceSessionId, call);
+    }
     if (call.name !== 'dispatch_session_task') {
       const tab = this.tabs.get(sourceSessionId);
       if (!tab) throw new Error('当前会话工具执行器不可用');
@@ -711,6 +766,42 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       throw new Error('工具参数超过允许长度');
     }
     return JSON.stringify({ ok: true, ...this.dispatchSessionTask(runtime, sourceSessionId, block) });
+  }
+
+  private async executeHistorySearch(
+    runtime: ActiveWorkspaceRuntime,
+    sessionId: string,
+    call: LLMToolCall,
+  ): Promise<string> {
+    let input: unknown;
+    try {
+      input = JSON.parse(call.arguments || '{}');
+    } catch {
+      throw new Error('工具参数不是有效的 JSON');
+    }
+    if (!input || typeof input !== 'object') throw new Error('工具参数必须是对象');
+    const values = input as Record<string, unknown>;
+    const query = typeof values.query === 'string' ? values.query.trim() : '';
+    if (!query) throw new Error('query 为必填字符串');
+    const topK = typeof values.topK === 'number' && values.topK >= 1 && values.topK <= 20
+      ? Math.floor(values.topK)
+      : 5;
+
+    const results = searchSessionArchive(runtime.workspace.folderPath, sessionId, query, topK);
+    if (results.length === 0) {
+      return JSON.stringify({ ok: true, results: [], message: '未找到匹配的归档历史消息' });
+    }
+    return JSON.stringify({
+      ok: true,
+      results: results.map((r) => ({
+        role: r.role,
+        score: Math.round(r.score * 100) / 100,
+        content: r.content.length > 2000
+          ? `${r.content.slice(0, 1200)}\n[…省略…]\n${r.content.slice(-800)}`
+          : r.content,
+        archivedAt: r.archivedAt,
+      })),
+    });
   }
 
   private async executeOrchestrateTask(
@@ -1241,7 +1332,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
             model: preset.model,
             apiFormat: preset.apiFormat,
             temperature: preset.temperature ?? 0.7,
-            contextWindow: preset.contextWindow ?? 1000000,
+            contextWindow: preset.contextWindow ?? 128000,
             thinkingStrength: preset.thinkingStrength ?? 'xhigh',
             apiKeyRequired: preset.apiKeyRequired,
           };
@@ -1257,7 +1348,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
         model: def.model,
         apiFormat: def.apiFormat,
         temperature: def.temperature ?? 0.7,
-        contextWindow: def.contextWindow ?? 1000000,
+        contextWindow: def.contextWindow ?? 128000,
         thinkingStrength: def.thinkingStrength ?? 'xhigh',
         apiKeyRequired: def.apiKeyRequired,
       };
@@ -1270,12 +1361,12 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       model: globalCfg.get<string>('model', 'gpt-4o-mini'),
       apiFormat: 'chat-completions',
       temperature: globalCfg.get<number>('temperature', 0.7),
-      contextWindow: 1000000,
+      contextWindow: 128000,
       thinkingStrength: 'xhigh',
     };
   }
 
-  private getContextUsage(messages: Array<{ content: string }>, contextWindow = 1000000): { used: number; limit: number; percent: number } {
+  private getContextUsage(messages: Array<{ content: string }>, contextWindow = 128000): { used: number; limit: number; percent: number } {
     const limit = Math.max(1, contextWindow);
     const used = estimateMessageTokens(messages);
     return { used, limit, percent: Math.min(100, Math.round((used / limit) * 100)) };
@@ -1303,7 +1394,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     return this.getContextUsage(messages, config.contextWindow);
   }
 
-  private postContextUsage(sessionId: string, messages: Array<{ content: string }>, contextWindow = 1000000): void {
+  private postContextUsage(sessionId: string, messages: Array<{ content: string }>, contextWindow = 128000): void {
     this.postToWebview({ type: 'contextUsage', sessionId, ...this.getContextUsage(messages, contextWindow) });
   }
 
@@ -1914,7 +2005,8 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       <button class="tool-btn" id="btnModel" title="点击切换模型">🤖<span class="model-name" id="modelName">未配置模型</span><span class="tip">切换模型</span></button>
       <div class="model-dropdown" id="modelDropdown"></div>
     </div>
-    <span class="context-usage" id="contextUsage" title="当前会话上下文估算占用">上下文 0 / 1M · 0%</span>
+    <span class="context-usage" id="contextUsage" title="当前会话上下文估算占用">上下文 0 / 128K · 0%</span>
+    <span class="token-usage" id="tokenUsage" title="API 返回的真实 token 用量" style="display:none;font-size:11px;color:var(--text3);"></span>
     <span class="timer" id="timer">00:00</span>
   </div>
   <div class="draft-contexts" id="draftContexts"></div>
@@ -2063,6 +2155,28 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     el.classList.toggle('danger', usage.percent >= 90);
   }
 
+  // 上一次 API 返回的真实 token 用量
+  let lastTokenUsage = null;
+  function updateTokenUsage(usage) {
+    if (!usage) return;
+    lastTokenUsage = usage;
+    const el = $('tokenUsage');
+    if (!el) return;
+    const parts = [];
+    parts.push('↑' + formatTokens(usage.promptTokens));
+    parts.push('↓' + formatTokens(usage.completionTokens));
+    if (usage.cacheHitTokens != null && usage.cacheHitTokens > 0) {
+      const totalInput = usage.cacheHitTokens + (usage.cacheMissTokens || 0);
+      const hitRate = totalInput > 0 ? Math.round(usage.cacheHitTokens / totalInput * 100) : 0;
+      parts.push('cache ' + hitRate + '%');
+    }
+    el.textContent = parts.join(' · ');
+    el.title = 'API 返回真实用量\\n输入: ' + usage.promptTokens.toLocaleString() + ' tokens\\n输出: ' + usage.completionTokens.toLocaleString() + ' tokens' +
+      (usage.cacheHitTokens != null ? '\\n缓存命中: ' + usage.cacheHitTokens.toLocaleString() + ' tokens' : '') +
+      (usage.cacheMissTokens != null ? '\\n缓存未命中: ' + usage.cacheMissTokens.toLocaleString() + ' tokens' : '');
+    el.style.display = '';
+  }
+
   function renderMarkdown(text) {
     if (!text) return '';
     let h = esc(text);
@@ -2086,6 +2200,11 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
   }
 
   // ─── 标签栏渲染 ───
+  function updateTabStreamingDot(sessionId, streaming) {
+    const tab = tabBarEl.querySelector('.session-tab[data-session-id="' + sessionId + '"]');
+    if (tab) tab.classList.toggle('streaming', !!streaming);
+  }
+
   function renderTabs(tabs) {
     tabStreamingMap = {};
     // 保留 add 按钮
@@ -2122,6 +2241,9 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
   }
 
   // ─── 消息渲染 ───
+  function getStreamingBubble() {
+    return messagesEl.querySelector('.bubble[data-streaming]');
+  }
   function renderMessages(sessionId, role, messages) {
     curSession = sessionId;
     curRoleName = role ? role.name : 'AI';
@@ -2129,10 +2251,20 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     messagesEl.innerHTML = '';
     if (!messages || messages.length === 0) {
       messagesEl.innerHTML = '<div style="text-align:center;color:var(--text3);padding:30px;font-size:12px;">开始与 '+esc(curRoleName)+' 对话</div>';
+      // 即使没有历史消息，如果当前会话正在 streaming 也需要重建 streaming 气泡
+      if (tabStreamingMap[sessionId]) {
+        const b = appendMessage('assistant', '', new Date().toISOString(), sessionId);
+        if (b) { b.classList.add('stream-cursor'); b.setAttribute('data-raw',''); b.setAttribute('data-streaming',''); }
+      }
       return;
     }
     autoFollowOutput = true;
     messages.forEach(m => appendMessage(m.role, m.content, m.createdAt, sessionId));
+    // 如果当前会话正在 streaming，重建一个空 streaming 气泡
+    if (tabStreamingMap[sessionId]) {
+      const b = appendMessage('assistant', '', new Date().toISOString(), sessionId);
+      if (b) { b.classList.add('stream-cursor'); b.setAttribute('data-raw',''); b.setAttribute('data-streaming',''); }
+    }
     scrollBottom(true);
   }
 
@@ -2911,6 +3043,8 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
           wsBar.style.display = 'none';
         }
         renderTabs(msg.tabs);
+        // 根据当前会话的 streaming 状态更新 UI（发送按钮/计时器）
+        setStreaming(!!tabStreamingMap[curSession]);
         break;
       case 'rolesList':
         curRoles = msg.roles || [];
@@ -2975,6 +3109,9 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       case 'contextUsage':
         if (msg.sessionId === curSession) updateContextUsage(msg);
         break;
+      case 'tokenUsage':
+        if (msg.sessionId === curSession) updateTokenUsage(msg.usage);
+        break;
       case 'appendDraftContext':
         appendDraftContext(msg.content || '');
         break;
@@ -2989,20 +3126,24 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
         appendMessage('system', '📋 ' + msg.mode, new Date().toISOString(), msg.sessionId);
         break;
       case 'streamStart': {
+        tabStreamingMap[msg.sessionId] = true;
+        updateTabStreamingDot(msg.sessionId, true);
         if (msg.sessionId !== curSession) break;
         setStreaming(true);
         autoFollowOutput = true;
         currentToolStatusEl = null;
         toolStatusElements.clear();
-        const b = appendMessage('assistant', '', new Date().toISOString(), msg.sessionId);
-        if (b) b.classList.add('stream-cursor');
-        b && b.setAttribute('data-raw','');
+        // 如果已存在 streaming 气泡（如 renderMessages 重建的），复用之
+        let b = getStreamingBubble();
+        if (!b) {
+          b = appendMessage('assistant', '', new Date().toISOString(), msg.sessionId);
+        }
+        if (b) { b.classList.add('stream-cursor'); b.setAttribute('data-raw',''); b.setAttribute('data-streaming',''); }
         break;
       }
       case 'reasoningChunk': {
         if (msg.sessionId !== curSession) break;
-        const bubbles = messagesEl.querySelectorAll('.msg-row.assistant .bubble');
-        const last = bubbles[bubbles.length-1];
+        const last = getStreamingBubble() || (messagesEl.querySelectorAll('.msg-row.assistant .bubble'))[0];
         if (last) {
           const panel = ensureReasoningPanel(last);
           const content = panel.querySelector('.reasoning-content');
@@ -3018,12 +3159,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       }
       case 'streamChunk': {
         if (msg.sessionId !== curSession) break;
-        const bubbles = messagesEl.querySelectorAll('.bubble');
-        // 找最后一个 assistant 气泡
-        let last = null;
-        for (const b of bubbles) {
-          if (b.closest('.msg-row.assistant')) last = b;
-        }
+        const last = getStreamingBubble();
         if (last) {
           const raw = last.getAttribute('data-raw') || '';
           const newText = raw + msg.delta;
@@ -3036,8 +3172,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       case 'toolStatus': {
         if (msg.sessionId !== curSession) break;
         const toolKey = msg.sessionId + ':' + (msg.callId || msg.name || '');
-        const bubbles = messagesEl.querySelectorAll('.msg-row.assistant .bubble');
-        const last = bubbles[bubbles.length-1];
+        const last = getStreamingBubble();
         if (!last) break;
         const badges = ensureToolBadges(last);
         let badge = toolStatusElements.get(toolKey);
@@ -3063,14 +3198,16 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
         break;
       }
       case 'streamEnd':
+        tabStreamingMap[msg.sessionId] = false;
+        updateTabStreamingDot(msg.sessionId, false);
         if (msg.sessionId !== curSession) break;
         setStreaming(false);
         if (msg.fullText) {
-          const bubbles = messagesEl.querySelectorAll('.msg-row.assistant .bubble');
-          const last = bubbles[bubbles.length-1];
+          const last = getStreamingBubble();
           if (last) {
             last.classList.remove('stream-cursor');
             last.removeAttribute('data-raw');
+            last.removeAttribute('data-streaming');
             last.innerHTML = renderMarkdown(msg.fullText);
             if (msg.reasoningText) {
               const panel = ensureReasoningPanel(last);
@@ -3083,10 +3220,10 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
             }
           }
         } else {
-          const bubbles = messagesEl.querySelectorAll('.msg-row.assistant .bubble');
-          const last = bubbles[bubbles.length-1];
+          const last = getStreamingBubble();
           if (last) {
             last.classList.remove('stream-cursor');
+            last.removeAttribute('data-streaming');
             last.textContent = msg.aborted ? '(已中断)' : '(已完成，无文本回复)';
           }
         }
@@ -3094,13 +3231,15 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
         toolStatusElements.clear();
         break;
       case 'streamError': {
+        tabStreamingMap[msg.sessionId] = false;
+        updateTabStreamingDot(msg.sessionId, false);
         if (msg.sessionId !== curSession) break;
         setStreaming(false);
-        const bubbles = messagesEl.querySelectorAll('.msg-row.assistant .bubble');
-        const last = bubbles[bubbles.length-1];
+        const last = getStreamingBubble();
         if (last) {
           last.classList.remove('stream-cursor');
           last.removeAttribute('data-raw');
+          last.removeAttribute('data-streaming');
           last.innerHTML = msg.fullText ? renderMarkdown(msg.fullText) : '(生成失败)';
           if (msg.reasoningText) {
             const panel = ensureReasoningPanel(last);
