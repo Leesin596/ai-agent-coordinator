@@ -176,18 +176,26 @@ describe('LLM stream protocol compatibility', () => {
       'workspace_search',
       'workspace_write_file',
       'workspace_replace',
+      'workspace_apply_diff',
+      'workspace_search_replace',
       'workspace_delete',
       'git_status',
       'git_diff',
       'run_command',
+      'todo_list_create',
+      'todo_list_update',
+      'todo_list_read',
+      'todo_list_delete',
+      'workspace_semantic_search',
+      'orchestrate_task',
     ]);
   });
 
   it('rejects excessive parallel tool calls before execution', async () => {
-    const calls = Array.from({ length: 9 }, (_, index) => ({
+    const calls = Array.from({ length: 17 }, (_, index) => ({
       index,
       id: `call_${index}`,
-      function: { name: 'workspace_list_files', arguments: '{}' },
+      function: { name: 'workspace_list_files', arguments: JSON.stringify({ path: `dir_${index}` }) },
     }));
     const server = createServer((_request, response) => {
       response.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -211,7 +219,7 @@ describe('LLM stream protocol compatibility', () => {
           },
         );
       });
-      expect(message).toContain('工具调用数量超过安全上限');
+      expect(message).toContain('超过安全上限');
       expect(executions).toBe(0);
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -269,6 +277,92 @@ describe('LLM stream protocol compatibility', () => {
       await new Promise((resolve) => setTimeout(resolve, 60));
       expect(events).toEqual([]);
     } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it('consumes streamChatGenerator via for-await-of with tool call round-trip', async () => {
+    const bodies: Array<Record<string, any>> = [];
+    const server = createServer((request, response) => {
+      let body = '';
+      request.on('data', (chunk) => { body += chunk.toString(); });
+      request.on('end', () => {
+        bodies.push(JSON.parse(body));
+        response.writeHead(200, { 'content-type': 'text/event-stream' });
+        if (bodies.length === 1) {
+          response.write('data: {"choices":[{"delta":{"reasoning_content":"思考"},"finish_reason":null}]}\n\n');
+          response.write('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_g1","function":{"name":"workspace_list_files","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n');
+        } else {
+          response.end('data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}\n\n');
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('测试服务监听失败');
+
+    try {
+      const chunks: Array<{ type: string; [key: string]: any }> = [];
+      const toolCalls: string[] = [];
+      const service = new LLMService();
+      const controller = new AbortController();
+
+      for await (const chunk of service.streamChatGenerator(
+        [{ role: 'user', content: '列出文件' }],
+        { ...config, baseURL: `http://127.0.0.1:${address.port}/v1`, apiFormat: 'chat-completions' },
+        {
+          toolExecutor: async (call) => {
+            toolCalls.push(call.name);
+            return '{"ok":true,"result":{"files":[]}}';
+          },
+          abortController: controller,
+        },
+      )) {
+        chunks.push(chunk);
+      }
+
+      const types = chunks.map((c) => c.type);
+      expect(types).toContain('reasoning');
+      expect(types).toContain('toolCall');
+      expect(types).toContain('toolResult');
+      expect(types).toContain('text');
+      expect(types).toContain('done');
+      expect(toolCalls).toEqual(['workspace_list_files']);
+      const doneChunk = chunks.find((c) => c.type === 'done');
+      expect(doneChunk?.fullText).toBe('done');
+      expect(doneChunk?.reasoningText).toBe('思考');
+      expect(bodies).toHaveLength(2);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  }, 15000);
+
+  it('streamChatGenerator aborts cleanly via AbortController', async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      setTimeout(() => response.end('data: {"choices":[{"delta":{"content":"迟到"},"finish_reason":"stop"}]}\n\n'), 30);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('测试服务监听失败');
+
+    try {
+      const chunks: Array<{ type: string }> = [];
+      const controller = new AbortController();
+      const service = new LLMService();
+
+      for await (const chunk of service.streamChatGenerator(
+        [{ role: 'user', content: '测试' }],
+        { ...config, baseURL: `http://127.0.0.1:${address.port}/v1`, apiFormat: 'chat-completions' },
+        { abortController: controller },
+      )) {
+        chunks.push(chunk);
+        controller.abort();
+      }
+      expect(chunks).not.toContainEqual({ type: 'done' });
+    } finally {
+      server.closeAllConnections();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
   });

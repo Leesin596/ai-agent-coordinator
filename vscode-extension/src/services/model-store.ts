@@ -21,6 +21,7 @@ export interface ModelPreset {
   thinkingStrength?: string; // 思考强度: low / medium / high / xhigh
   contextWindow?: number;    // 上下文窗口 (tokens)
   temperature?: number;
+  apiKeyRequired?: boolean;  // 是否需要 API Key（本地模型如 Ollama 设为 false）
   createdAt: string;
 }
 
@@ -30,13 +31,18 @@ export const MODEL_QUICK_PRESETS: {
   model: string;
   baseURL: string;
   apiFormat: ModelApiFormat;
+  apiKeyRequired: boolean;
 }[] = [
-  { name: 'GPT-5.6 Sol', model: 'gpt-5.6-sol', baseURL: 'https://api.openai.com/v1', apiFormat: 'responses' },
-  { name: 'GPT-5.6 Terra', model: 'gpt-5.6-terra', baseURL: 'https://api.openai.com/v1', apiFormat: 'responses' },
-  { name: 'Claude Sonnet 5', model: 'claude-sonnet-5', baseURL: 'https://api.anthropic.com', apiFormat: 'anthropic-messages' },
-  { name: 'Claude Opus 4.8', model: 'claude-opus-4-8', baseURL: 'https://api.anthropic.com', apiFormat: 'anthropic-messages' },
-  { name: 'DeepSeek V4 Pro', model: 'deepseek-v4-pro', baseURL: 'https://api.deepseek.com', apiFormat: 'chat-completions' },
-  { name: 'GLM-5.2', model: 'glm-5.2', baseURL: 'https://open.bigmodel.cn/api/paas/v4', apiFormat: 'chat-completions' },
+  { name: 'GPT-5.6 Sol', model: 'gpt-5.6-sol', baseURL: 'https://api.openai.com/v1', apiFormat: 'responses', apiKeyRequired: true },
+  { name: 'GPT-5.6 Terra', model: 'gpt-5.6-terra', baseURL: 'https://api.openai.com/v1', apiFormat: 'responses', apiKeyRequired: true },
+  { name: 'Claude Sonnet 5', model: 'claude-sonnet-5', baseURL: 'https://api.anthropic.com', apiFormat: 'anthropic-messages', apiKeyRequired: true },
+  { name: 'Claude Opus 4.8', model: 'claude-opus-4-8', baseURL: 'https://api.anthropic.com', apiFormat: 'anthropic-messages', apiKeyRequired: true },
+  { name: 'DeepSeek V4 Pro', model: 'deepseek-v4-pro', baseURL: 'https://api.deepseek.com', apiFormat: 'chat-completions', apiKeyRequired: true },
+  { name: 'DeepSeek Reasoner', model: 'deepseek-reasoner', baseURL: 'https://api.deepseek.com', apiFormat: 'chat-completions', apiKeyRequired: true },
+  { name: 'GLM-5.2', model: 'glm-5.2', baseURL: 'https://open.bigmodel.cn/api/paas/v4', apiFormat: 'chat-completions', apiKeyRequired: true },
+  { name: 'Ollama (local)', model: 'llama3.2', baseURL: 'http://localhost:11434/v1', apiFormat: 'chat-completions', apiKeyRequired: false },
+  { name: 'OpenRouter Auto', model: 'auto', baseURL: 'https://openrouter.ai/api/v1', apiFormat: 'chat-completions', apiKeyRequired: true },
+  { name: 'Gemini 2.5 Pro', model: 'gemini-2.5-pro', baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai', apiFormat: 'chat-completions', apiKeyRequired: true },
 ];
 
 const KEY_MODELS = 'coordinator.models';
