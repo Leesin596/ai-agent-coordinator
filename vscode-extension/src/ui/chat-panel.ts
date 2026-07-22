@@ -48,6 +48,7 @@ export class ChatPanel {
   private terminalService = new TerminalService();
   private abortFn: (() => void) | null = null;
   private isStreaming = false;
+  private orchestrationAborted = false;
   private role: Role;
   private session: Session;
   private ctx: CoordinatorContext;
@@ -464,17 +465,21 @@ export class ChatPanel {
     this.orchestrator.setRoleManager(this.runtime.roleManager);
 
     const config = this.getLLMConfig(this.session.id);
-    const llmCall: LLMCallFunction = (messages, options) =>
-      this.llm.chat(messages as LLMMessage[], {
+    const llmCall: LLMCallFunction = (messages, options) => {
+      if (this.orchestrationAborted) throw new Error('用户已取消编排');
+      return this.llm.chat(messages as LLMMessage[], {
         ...config,
         temperature: options?.temperature ?? 0.3,
         maxTokens: options?.maxTokens,
         tools: undefined,
       });
+    };
 
+    this.orchestrationAborted = false;
     this.sendToWebview({ type: 'systemMessage', content: `🔄 开始自动编排任务: ${description.slice(0, 100)}...` });
 
     try {
+      if (this.orchestrationAborted) throw new Error('用户已取消编排');
       const result = await this.orchestrator.orchestrate(
         {
           description,
@@ -588,6 +593,8 @@ export class ChatPanel {
 
   private handleAbort(): void {
     this.toolExecutor.cancel();
+    this.orchestrationAborted = true;
+    this.orchestrator.cancel();
     if (this.abortFn) {
       this.abortFn();
       this.abortFn = null;

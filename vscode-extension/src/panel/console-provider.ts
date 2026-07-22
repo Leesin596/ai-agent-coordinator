@@ -48,6 +48,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
   private llm = new LLMService();
   private tabs = new Map<string, SessionTab>();
   private currentSessionId: string | null = null;
+  private orchestrationAborted = false;
   private lastUsedRoleId: string | null = null;
   private pendingRoleEditorId: string | null | undefined;
   private pendingNewRoleEditor = false;
@@ -740,17 +741,21 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     this.orchestrator.setRoleManager(runtime.roleManager);
 
     const config = this.getLLMConfig(sourceSessionId);
-    const llmCall: LLMCallFunction = (messages, options) =>
-      this.llm.chat(messages as LLMMessage[], {
+    const llmCall: LLMCallFunction = (messages, options) => {
+      if (this.orchestrationAborted) throw new Error('用户已取消编排');
+      return this.llm.chat(messages as LLMMessage[], {
         ...config,
         temperature: options?.temperature ?? 0.3,
         maxTokens: options?.maxTokens,
         tools: undefined,
       });
+    };
 
+    this.orchestrationAborted = false;
     this.postToWebview({ type: 'systemMessage', sessionId: sourceSessionId, content: `🔄 开始自动编排任务: ${description.slice(0, 100)}...` });
 
     try {
+      if (this.orchestrationAborted) throw new Error('用户已取消编排');
       const result = await this.orchestrator.orchestrate(
         {
           description,
@@ -870,6 +875,8 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
   private handleAbort(sessionId: string): void {
     const tab = this.tabs.get(sessionId);
     tab?.toolExecutor.cancel();
+    this.orchestrationAborted = true;
+    this.orchestrator.cancel();
     if (tab?.abortFn) {
       tab.abortFn();
       tab.abortFn = null;

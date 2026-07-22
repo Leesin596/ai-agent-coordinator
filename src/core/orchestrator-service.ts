@@ -45,6 +45,22 @@ export class OrchestratorService {
   private dispatcher: SessionTaskDispatcher | null = null;
   private sessionManager: SessionManager | null = null;
   private roleManager: RoleManager | null = null;
+  private cancelCallbacks = new Set<() => void>();
+  private cancelled = false;
+
+  /** 取消正在进行的编排：所有 waitForTaskCompletion 立即以 cancelled 状态返回 */
+  cancel(): void {
+    this.cancelled = true;
+    for (const cb of this.cancelCallbacks) {
+      try { cb(); } catch (_e) {}
+    }
+    this.cancelCallbacks.clear();
+  }
+
+  private resetCancelState(): void {
+    this.cancelled = false;
+    this.cancelCallbacks.clear();
+  }
 
   setDB(db: CoordinatorDB): void {
     this.db = db;
@@ -74,6 +90,7 @@ export class OrchestratorService {
     input: OrchestrateInput,
     llmCall: LLMCallFunction,
   ): Promise<OrchestrationResult> {
+    this.resetCancelState();
     const orchestrationId = randomUUID();
     const maxSubTasks = input.maxSubTasks ?? DEFAULT_MAX_SUB_TASKS;
     const maxDepth = input.maxDepth ?? DEFAULT_MAX_DEPTH;
@@ -112,6 +129,17 @@ export class OrchestratorService {
       timeoutMs,
       maxDepth,
     );
+
+    // 用户取消后跳过汇总，直接返回已收集的部分结果
+    if (this.cancelled) {
+      return {
+        plan,
+        subTaskResults: results,
+        summary: '用户已取消编排，以下为已完成的子任务结果',
+        status: 'partial',
+        orchestrationId,
+      };
+    }
 
     // 4. 汇总结果
     const summary = await this.summarizeResults(
@@ -279,7 +307,7 @@ export class OrchestratorService {
     const overallTimer = setTimeout(() => { timedOut = true; }, timeoutMs);
 
     try {
-      while (remaining.size > 0 && !timedOut) {
+      while (remaining.size > 0 && !timedOut && !this.cancelled) {
         // 找出当前可执行的子任务（依赖全部已完成或已处理）
         const batch = subTasks.filter(
           (st) =>
@@ -356,6 +384,24 @@ export class OrchestratorService {
               taskId: '',
               status: 'timeout',
               result: `全局超时 (${timeoutMs}ms)，任务未执行完`,
+            });
+          }
+        }
+      }
+
+      // 用户取消：未完成的子任务标记为 cancelled
+      if (this.cancelled) {
+        for (const idx of remaining) {
+          const st = subTasks.find((s) => s.index === idx)!;
+          if (!results.has(idx)) {
+            results.set(idx, {
+              index: idx,
+              title: st.title,
+              targetRole: st.targetRole,
+              targetSessionId: '',
+              taskId: '',
+              status: 'cancelled',
+              result: '用户已取消编排',
             });
           }
         }
@@ -514,6 +560,7 @@ export class OrchestratorService {
         if (unsubCancelled) unsubCancelled();
         if (unsubRejected) unsubRejected();
         clearTimeout(timer);
+        this.cancelCallbacks.delete(cancelCb);
       };
 
       const done = (result: { status: SubTaskResult['status']; result: string }) => {
@@ -522,6 +569,10 @@ export class OrchestratorService {
         cleanup();
         resolve(result);
       };
+
+      // 注册取消回调（cancel() 调用时立即以 cancelled 状态返回）
+      const cancelCb = () => done({ status: 'cancelled', result: '用户已取消编排' });
+      this.cancelCallbacks.add(cancelCb);
 
       // 监听完成/取消事件
       const handler = (event: any) => {
