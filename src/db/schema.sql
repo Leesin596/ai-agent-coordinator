@@ -157,6 +157,8 @@ CREATE TABLE IF NOT EXISTS roles (
   built_in      INTEGER NOT NULL DEFAULT 0,
   sort_order    INTEGER NOT NULL DEFAULT 0,
   llm_config    TEXT NOT NULL DEFAULT '{}',       -- JSON: 角色级 LLM 配置（apiKey/baseURL/model/temperature，留空回退全局）
+  allowed_tools TEXT NOT NULL DEFAULT '[]',       -- JSON: 允许的工具名称白名单
+  denied_tools  TEXT NOT NULL DEFAULT '[]',       -- JSON: 禁止的工具名称黑名单
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL
 );

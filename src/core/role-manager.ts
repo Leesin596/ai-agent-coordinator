@@ -410,6 +410,8 @@ export class RoleManager {
       builtIn: false,
       sortOrder: 99,
       llmConfig: (input as any).llmConfig || undefined,
+      allowedTools: input.allowedTools || [],
+      deniedTools: input.deniedTools || [],
       createdAt: now,
       updatedAt: now,
     };
@@ -417,7 +419,7 @@ export class RoleManager {
     return role;
   }
 
-  update(id: string, updates: Partial<Pick<Role, 'name' | 'category' | 'description' | 'skillSlug' | 'skills' | 'skillContent' | 'systemPrompt' | 'icon' | 'sortOrder' | 'llmConfig'>>): Role {
+  update(id: string, updates: Partial<Pick<Role, 'name' | 'category' | 'description' | 'skillSlug' | 'skills' | 'skillContent' | 'systemPrompt' | 'icon' | 'sortOrder' | 'llmConfig' | 'allowedTools' | 'deniedTools'>>): Role {
     if (!this.db) throw new Error('DB not initialized');
     const role = this.db.getRole(id);
     if (!role) throw new Error(`Role not found: ${id}`);

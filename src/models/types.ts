@@ -231,6 +231,10 @@ export interface Role {
   sortOrder: number;
   /** 角色级 LLM 配置（可选，留空字段回退全局） */
   llmConfig?: RoleLLMConfig;
+  /** 允许使用的工具名称白名单（空=继承默认全部工具） */
+  allowedTools?: string[];
+  /** 禁止使用的工具名称黑名单（优先于 allowedTools） */
+  deniedTools?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -245,6 +249,8 @@ export interface CreateRoleInput {
   systemPrompt?: string;
   icon?: string;
   llmConfig?: RoleLLMConfig;
+  allowedTools?: string[];
+  deniedTools?: string[];
 }
 
 export const ROLE_CATEGORY_LABELS: Record<RoleCategory, string> = {
@@ -380,4 +386,80 @@ export interface AlignedContextView {
   // 编译成 Markdown 的完整对齐文档（双方共享同一份）
   document: string;
   generatedAt: string;
+}
+
+// ============================================================
+// Orchestrator — 自动编排（P2-13）
+// ============================================================
+
+/** LLM 调用接口（由调用方注入实现，core 层不依赖具体 LLM service） */
+export interface LLMCallFunction {
+  (messages: Array<{ role: string; content: string }>, options?: { temperature?: number; maxTokens?: number }): Promise<string>;
+}
+
+/** 编排子任务（LLM 拆解输出） */
+export interface SubTask {
+  /** 子任务在编排计划中的索引（0-based），用于依赖引用 */
+  index: number;
+  title: string;
+  objective: string;
+  /** 目标角色 ID 或角色名称关键词（用于自动匹配角色） */
+  targetRole: string;
+  /** 依赖的子任务索引列表 */
+  dependencies: number[];
+  /** 验收标准 */
+  acceptanceCriteria: string[];
+  /** 期望产出 */
+  expectedOutput: string;
+}
+
+/** 编排计划 */
+export interface OrchestrationPlan {
+  /** 原始任务描述 */
+  description: string;
+  /** 拆解出的子任务列表 */
+  subTasks: SubTask[];
+  /** 编排摘要（LLM 生成的计划说明） */
+  summary: string;
+}
+
+/** 编排输入参数 */
+export interface OrchestrateInput {
+  /** 任务描述 */
+  description: string;
+  /** 上下文摘要（可选） */
+  context?: string;
+  /** 源会话 ID（编排发起方） */
+  sourceSessionId: string;
+  /** 工作区 ID */
+  workspaceId: string;
+  /** 最大子任务数（默认 5） */
+  maxSubTasks?: number;
+  /** 编排深度（默认 2，防止递归编排） */
+  maxDepth?: number;
+  /** 等待子任务完成的超时时间（毫秒，默认 120000） */
+  timeoutMs?: number;
+}
+
+/** 单个子任务的执行结果 */
+export interface SubTaskResult {
+  index: number;
+  title: string;
+  targetRole: string;
+  targetSessionId: string;
+  taskId: string;
+  status: 'completed' | 'cancelled' | 'failed' | 'timeout';
+  result: string;
+}
+
+/** 编排最终结果 */
+export interface OrchestrationResult {
+  plan: OrchestrationPlan;
+  subTaskResults: SubTaskResult[];
+  /** LLM 生成的汇总报告 */
+  summary: string;
+  /** 整体状态 */
+  status: 'completed' | 'partial' | 'failed';
+  /** 编排 ID */
+  orchestrationId: string;
 }

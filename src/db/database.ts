@@ -289,10 +289,11 @@ export class CoordinatorDB {
    */
   private migrateRolesColumns(): void {
     const requiredColumns: Record<string, string> = {
-      // 列名 → DDL 类型定义
       skill_slug: "TEXT NOT NULL DEFAULT ''",
       skill_content: "TEXT NOT NULL DEFAULT ''",
       llm_config: "TEXT NOT NULL DEFAULT '{}'",
+      allowed_tools: "TEXT NOT NULL DEFAULT '[]'",
+      denied_tools: "TEXT NOT NULL DEFAULT '[]'",
     };
     const existing = new Set(this.listTableColumns('roles'));
     for (const [col, ddl] of Object.entries(requiredColumns)) {
@@ -727,8 +728,8 @@ export class CoordinatorDB {
 
   insertRole(role: Record<string, any>): void {
     this.exec(`
-      INSERT INTO roles (id, name, category, description, skill_slug, skills, skill_content, system_prompt, icon, built_in, sort_order, llm_config, created_at, updated_at)
-      VALUES (@id, @name, @category, @description, @skill_slug, @skills, @skill_content, @system_prompt, @icon, @built_in, @sort_order, @llm_config, @created_at, @updated_at)
+      INSERT INTO roles (id, name, category, description, skill_slug, skills, skill_content, system_prompt, icon, built_in, sort_order, llm_config, allowed_tools, denied_tools, created_at, updated_at)
+      VALUES (@id, @name, @category, @description, @skill_slug, @skills, @skill_content, @system_prompt, @icon, @built_in, @sort_order, @llm_config, @allowed_tools, @denied_tools, @created_at, @updated_at)
     `, {
       id: role.id,
       name: role.name,
@@ -742,6 +743,8 @@ export class CoordinatorDB {
       built_in: role.builtIn ? 1 : 0,
       sort_order: role.sortOrder || 0,
       llm_config: JSON.stringify(role.llmConfig || {}),
+      allowed_tools: JSON.stringify(role.allowedTools || []),
+      denied_tools: JSON.stringify(role.deniedTools || []),
       created_at: role.createdAt,
       updated_at: role.updatedAt,
     });
@@ -776,6 +779,8 @@ export class CoordinatorDB {
     if (updates.icon !== undefined) { setClauses.push('icon = @icon'); params.icon = updates.icon; }
     if (updates.sortOrder !== undefined) { setClauses.push('sort_order = @sort_order'); params.sort_order = updates.sortOrder; }
     if (updates.llmConfig !== undefined) { setClauses.push('llm_config = @llm_config'); params.llm_config = JSON.stringify(updates.llmConfig || {}); }
+    if (updates.allowedTools !== undefined) { setClauses.push('allowed_tools = @allowed_tools'); params.allowed_tools = JSON.stringify(updates.allowedTools || []); }
+    if (updates.deniedTools !== undefined) { setClauses.push('denied_tools = @denied_tools'); params.denied_tools = JSON.stringify(updates.deniedTools || []); }
     setClauses.push('updated_at = @updated_at'); params.updated_at = new Date().toISOString();
     if (setClauses.length === 1) return false;
     return this.exec(`UPDATE roles SET ${setClauses.join(', ')} WHERE id = @id`, params) > 0;
@@ -1039,6 +1044,14 @@ export class CoordinatorDB {
     if (row.llm_config !== undefined && row.llm_config !== null) {
       try { llmConfig = JSON.parse(row.llm_config) || {}; } catch { llmConfig = {}; }
     }
+    let allowedTools: string[] = [];
+    let deniedTools: string[] = [];
+    if (row.allowed_tools !== undefined && row.allowed_tools !== null) {
+      try { allowedTools = JSON.parse(row.allowed_tools) || []; } catch { allowedTools = []; }
+    }
+    if (row.denied_tools !== undefined && row.denied_tools !== null) {
+      try { deniedTools = JSON.parse(row.denied_tools) || []; } catch { deniedTools = []; }
+    }
     return {
       id: row.id,
       name: row.name,
@@ -1052,6 +1065,8 @@ export class CoordinatorDB {
       builtIn: row.built_in === 1,
       sortOrder: row.sort_order,
       llmConfig,
+      allowedTools,
+      deniedTools,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
