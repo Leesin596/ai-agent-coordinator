@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build root project
+        run: npm run build
+
+      - name: Install VS Code extension dependencies
+        run: npm --prefix vscode-extension ci
+
+      - name: Build VS Code extension
+        run: npm --prefix vscode-extension run build
+
+      - name: Package VSIX
+        run: |
+          cd vscode-extension
+          npx vsce package --no-git-tag-version --allow-missing-repository
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Upload VSIX to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: vscode-extension/*.vsix
+          body: |
+            ## Installation
+
+            Download the `.vsix` file below and install:
+
+            ```
+            code --install-extension ai-agent-coordinator-${{ steps.version.outputs.VERSION }}.vsix
+            ```
+
+            Or install from source:
+
+            ```bash
+            git clone https://github.com/Leesin596/ai-agent-coordinator.git
+            cd ai-agent-coordinator
+            npm ci && npm run build
+            cd vscode-extension && npm ci && npm run build
+            npx vsce package --no-git-tag-version
+            code --install-extension ai-agent-coordinator-${{ steps.version.outputs.VERSION }}.vsix
+            ```

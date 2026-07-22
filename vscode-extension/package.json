@@ -2,7 +2,7 @@
   "name": "ai-agent-coordinator",
   "displayName": "AI Agent Coordinator",
   "description": "Multi-AI Agent Collaboration Coordinator",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "license": "MIT",
   "publisher": "Leesin596",
   "repository": {
