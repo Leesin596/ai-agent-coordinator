@@ -2,6 +2,11 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn, type ChildProcess } from 'child_process';
+import { CheckpointManager } from './checkpoint-manager';
+import { TodoListManager } from './todo-list-manager';
+import type { IndexingService, SearchResult } from './indexing-service';
+import type { Role } from '../../../src/models/types';
+import { isToolAllowedByRole } from './tool-filter';
 
 export interface ToolCallInput {
   name: string;
@@ -12,9 +17,20 @@ export interface ToolApprovalRequest {
   title: string;
   detail: string;
   confirmLabel: string;
+  toolName?: string;
 }
 
 export type ToolApprovalHandler = (request: ToolApprovalRequest) => Promise<boolean>;
+
+export interface TerminalRunResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  truncated: boolean;
+}
+
+export type TerminalRunner = (command: string, cwd: string, timeoutSeconds: number) => Promise<TerminalRunResult>;
 
 const MAX_READ_BYTES = 1024 * 1024;
 const MAX_WRITE_BYTES = 2 * 1024 * 1024;
@@ -107,10 +123,44 @@ export class WorkspaceToolExecutor {
   private readonly realRoot: string;
   private readonly activeProcesses = new Set<ChildProcess>();
   private cancelled = false;
+  private checkpointManager: CheckpointManager | null = null;
+  private terminalRunner: TerminalRunner | null = null;
+  private role: Role | undefined;
+  private todoListManager: TodoListManager | null = null;
+  private indexingService: IndexingService | null = null;
+  private sessionId: string | null = null;
 
   constructor(root: string, private readonly approve: ToolApprovalHandler) {
     this.root = path.resolve(root);
     this.realRoot = fs.realpathSync(this.root);
+  }
+
+  setRole(role: Role | undefined): void {
+    this.role = role;
+  }
+
+  setCheckpointManager(manager: CheckpointManager | null): void {
+    this.checkpointManager = manager;
+  }
+
+  setTerminalRunner(runner: TerminalRunner | null): void {
+    this.terminalRunner = runner;
+  }
+
+  setTodoListManager(manager: TodoListManager | null): void {
+    this.todoListManager = manager;
+  }
+
+  setIndexingService(service: IndexingService | null): void {
+    this.indexingService = service;
+  }
+
+  setSessionId(sessionId: string | null): void {
+    this.sessionId = sessionId;
+  }
+
+  getCheckpointManager(): CheckpointManager | null {
+    return this.checkpointManager;
   }
 
   begin(): void {
@@ -125,6 +175,9 @@ export class WorkspaceToolExecutor {
 
   async execute(call: ToolCallInput): Promise<string> {
     if (this.cancelled) throw new Error('工具执行已取消');
+    if (!isToolAllowedByRole(call.name, this.role)) {
+      throw new Error(`角色「${this.role?.name || '未知'}」无权使用工具: ${call.name}`);
+    }
     const values = asObject(call.arguments);
     let result: unknown;
     switch (call.name) {
@@ -133,10 +186,17 @@ export class WorkspaceToolExecutor {
       case 'workspace_search': result = this.search(values); break;
       case 'workspace_write_file': result = await this.writeFile(values); break;
       case 'workspace_replace': result = await this.replaceFile(values); break;
+      case 'workspace_apply_diff': result = await this.applyDiff(values); break;
+      case 'workspace_search_replace': result = await this.searchReplace(values); break;
       case 'workspace_delete': result = await this.deletePath(values); break;
       case 'git_status': result = await this.gitStatus(); break;
       case 'git_diff': result = await this.gitDiff(values); break;
       case 'run_command': result = await this.runCommand(values); break;
+      case 'todo_list_create': result = this.todoListCreate(values); break;
+      case 'todo_list_update': result = this.todoListUpdate(values); break;
+      case 'todo_list_delete': result = this.todoListDelete(values); break;
+      case 'todo_list_read': result = this.todoListRead(); break;
+      case 'workspace_semantic_search': result = await this.semanticSearch(values); break;
       default: throw new Error(`不支持的工具: ${call.name}`);
     }
     return JSON.stringify({ ok: true, result });
@@ -266,10 +326,11 @@ export class WorkspaceToolExecutor {
     }
     const expected = typeof values.expectedSha256 === 'string' ? values.expectedSha256 : '';
     if (exists && (!expected || expected !== sha256(oldContent))) throw new Error('覆盖现有文件前必须提供 read_file 返回的 expectedSha256');
-    const approved = await this.approve({ title: exists ? `允许覆盖 ${relativePath}？` : `允许创建 ${relativePath}？`, detail: formatPreview(oldContent, content), confirmLabel: exists ? '覆盖文件' : '创建文件' });
+    const approved = await this.approve({ title: exists ? `允许覆盖 ${relativePath}？` : `允许创建 ${relativePath}？`, detail: formatPreview(oldContent, content), confirmLabel: exists ? '覆盖文件' : '创建文件', toolName: 'workspace_write_file' });
     if (!approved) throw new Error('用户拒绝了文件写入');
     if (this.cancelled) throw new Error('工具执行已取消');
     if (exists && sha256(fs.readFileSync(absolute)) !== expected) throw new Error('文件在审批期间已被修改，请重新读取');
+    if (this.checkpointManager && exists) this.checkpointManager.createCheckpoint(`写入 ${relativePath}`, [relativePath]);
     fs.mkdirSync(path.dirname(absolute), { recursive: true });
     fs.writeFileSync(absolute, content, 'utf8');
     return { path: this.relative(absolute), bytes: Buffer.byteLength(content), sha256: sha256(content) };
@@ -293,10 +354,65 @@ export class WorkspaceToolExecutor {
     const after = replaceAll ? before.split(oldText).join(newText) : before.replace(oldText, newText);
     if (Buffer.byteLength(after) > MAX_WRITE_BYTES) throw new Error('修改后文件超过 2MB 上限');
     const beforeHash = sha256(before);
-    const approved = await this.approve({ title: `允许修改 ${relativePath}？`, detail: formatPreview(before, after), confirmLabel: '应用修改' });
+    const approved = await this.approve({ title: `允许修改 ${relativePath}？`, detail: formatPreview(before, after), confirmLabel: '应用修改', toolName: 'workspace_replace' });
     if (!approved) throw new Error('用户拒绝了文件修改');
     if (this.cancelled) throw new Error('工具执行已取消');
     if (sha256(fs.readFileSync(absolute)) !== beforeHash) throw new Error('文件在审批期间已被修改，请重新读取');
+    if (this.checkpointManager) this.checkpointManager.createCheckpoint(`替换 ${relativePath}`, [relativePath]);
+    fs.writeFileSync(absolute, after, 'utf8');
+    return { path: this.relative(absolute), replacements: replaceAll ? occurrences : 1, sha256: sha256(after) };
+  }
+
+  private async applyDiff(values: Record<string, unknown>): Promise<unknown> {
+    const relativePath = requiredString(values, 'path', 1000);
+    const diff = requiredText(values, 'diff', MAX_WRITE_BYTES);
+    const absolute = this.resolve(relativePath);
+    const stat = fs.statSync(absolute);
+    if (!stat.isFile()) throw new Error('path 必须是文件');
+    if (stat.size > MAX_WRITE_BYTES) throw new Error('文件超过 2MB 修改上限');
+    const buffer = fs.readFileSync(absolute);
+    if (isBinary(buffer)) throw new Error('不支持修改二进制文件');
+    const before = buffer.toString('utf8');
+    const beforeHash = sha256(before);
+    let after: string;
+    try {
+      after = applyUnifiedDiff(before, diff);
+    } catch (err) {
+      throw new Error(`apply_diff 失败: ${(err as Error).message}`);
+    }
+    if (after === before) throw new Error('diff 未产生任何变化');
+    if (Buffer.byteLength(after) > MAX_WRITE_BYTES) throw new Error('修改后文件超过 2MB 上限');
+    const approved = await this.approve({ title: `允许应用 diff 到 ${relativePath}？`, detail: formatPreview(before, after), confirmLabel: '应用 Diff', toolName: 'workspace_apply_diff' });
+    if (!approved) throw new Error('用户拒绝了 diff 应用');
+    if (this.cancelled) throw new Error('工具执行已取消');
+    if (sha256(fs.readFileSync(absolute)) !== beforeHash) throw new Error('文件在审批期间已被修改，请重新读取');
+    if (this.checkpointManager) this.checkpointManager.createCheckpoint(`Diff ${relativePath}`, [relativePath]);
+    fs.writeFileSync(absolute, after, 'utf8');
+    return { path: this.relative(absolute), sha256: sha256(after) };
+  }
+
+  private async searchReplace(values: Record<string, unknown>): Promise<unknown> {
+    const relativePath = requiredString(values, 'path', 1000);
+    const searchText = requiredText(values, 'searchText', MAX_WRITE_BYTES);
+    const replaceText = requiredText(values, 'replaceText', MAX_WRITE_BYTES);
+    const replaceAll = values.replaceAll === true;
+    const absolute = this.resolve(relativePath);
+    const stat = fs.statSync(absolute);
+    if (!stat.isFile()) throw new Error('path 必须是文件');
+    if (stat.size > MAX_WRITE_BYTES) throw new Error('文件超过 2MB 修改上限');
+    const buffer = fs.readFileSync(absolute);
+    if (isBinary(buffer)) throw new Error('不支持修改二进制文件');
+    const before = buffer.toString('utf8');
+    const occurrences = before.split(searchText).length - 1;
+    if (occurrences === 0) throw new Error('searchText 在文件中不存在');
+    const after = replaceAll ? before.split(searchText).join(replaceText) : before.replace(searchText, replaceText);
+    if (Buffer.byteLength(after) > MAX_WRITE_BYTES) throw new Error('修改后文件超过 2MB 上限');
+    const beforeHash = sha256(before);
+    const approved = await this.approve({ title: `允许修改 ${relativePath}？`, detail: formatPreview(before, after), confirmLabel: '应用修改', toolName: 'workspace_search_replace' });
+    if (!approved) throw new Error('用户拒绝了文件修改');
+    if (this.cancelled) throw new Error('工具执行已取消');
+    if (sha256(fs.readFileSync(absolute)) !== beforeHash) throw new Error('文件在审批期间已被修改，请重新读取');
+    if (this.checkpointManager) this.checkpointManager.createCheckpoint(`搜索替换 ${relativePath}`, [relativePath]);
     fs.writeFileSync(absolute, after, 'utf8');
     return { path: this.relative(absolute), replacements: replaceAll ? occurrences : 1, sha256: sha256(after) };
   }
@@ -306,9 +422,10 @@ export class WorkspaceToolExecutor {
     const absolute = this.resolve(relativePath);
     const stat = fs.statSync(absolute);
     if (!stat.isFile()) throw new Error('仅允许删除文件');
-    const approved = await this.approve({ title: `允许删除 ${relativePath}？`, detail: `文件大小: ${stat.size} bytes\n此操作无法由插件自动恢复。`, confirmLabel: '删除文件' });
+    const approved = await this.approve({ title: `允许删除 ${relativePath}？`, detail: `文件大小: ${stat.size} bytes\n此操作无法由插件自动恢复。`, confirmLabel: '删除文件', toolName: 'workspace_delete' });
     if (!approved) throw new Error('用户拒绝了文件删除');
     if (this.cancelled) throw new Error('工具执行已取消');
+    if (this.checkpointManager) this.checkpointManager.createCheckpoint(`删除 ${relativePath}`, [relativePath]);
     fs.unlinkSync(absolute);
     return { path: relativePath, deleted: true };
   }
@@ -338,11 +455,84 @@ export class WorkspaceToolExecutor {
       title: highRisk ? '允许执行高风险命令？' : '允许执行命令？',
       detail: `风险级别: ${highRisk ? '高' : '普通'}\n工作目录: ${this.root}\n超时: ${timeoutSeconds} 秒\n\n${command}`,
       confirmLabel: highRisk ? '确认高风险执行' : '执行命令',
+      toolName: 'run_command',
     });
     if (!approved) throw new Error('用户拒绝了命令执行');
     if (this.cancelled) throw new Error('工具执行已取消');
+    if (this.terminalRunner) {
+      const output = await this.terminalRunner(command, this.root, timeoutSeconds);
+      if (output.timedOut) {
+        return { command, ...output, warning: `命令超时（${timeoutSeconds}秒），已发送 Ctrl+C 中断，但进程可能仍在终端中运行。如需确认，请检查 VS Code 终端面板。` };
+      }
+      return { command, ...output };
+    }
     const output = await this.runProcess(command, [], true, timeoutSeconds);
+    if (output.timedOut) {
+      return { command, ...output, warning: `命令超时（${timeoutSeconds}秒），进程已被终止。` };
+    }
     return { command, ...output };
+  }
+
+  private todoListCreate(values: Record<string, unknown>): unknown {
+    if (!this.todoListManager || !this.sessionId) {
+      throw new Error('Todo List 功能未初始化');
+    }
+    const rawItems = values.items;
+    if (!Array.isArray(rawItems) || rawItems.length === 0) {
+      throw new Error('items 必须是非空数组');
+    }
+    const inputs = rawItems.map((item: unknown) => {
+      if (!item || typeof item !== 'object') throw new Error('items 中每项必须是对象');
+      const obj = item as Record<string, unknown>;
+      const content = typeof obj.content === 'string' ? obj.content.trim() : '';
+      if (!content) throw new Error('items 中每项 content 不能为空');
+      return {
+        content,
+        priority: typeof obj.priority === 'string' ? (obj.priority as 'high' | 'medium' | 'low') : undefined,
+      };
+    });
+    const items = this.todoListManager.createTodos(this.sessionId, inputs);
+    return { items };
+  }
+
+  private todoListUpdate(values: Record<string, unknown>): unknown {
+    if (!this.todoListManager || !this.sessionId) {
+      throw new Error('Todo List 功能未初始化');
+    }
+    const id = typeof values.id === 'string' ? values.id.trim() : '';
+    if (!id) throw new Error('id 不能为空');
+    const patch: { status?: 'pending' | 'in_progress' | 'completed' | 'failed'; content?: string } = {};
+    if (typeof values.status === 'string') patch.status = values.status as 'pending' | 'in_progress' | 'completed' | 'failed';
+    if (typeof values.content === 'string') patch.content = values.content;
+    const item = this.todoListManager.updateTodo(this.sessionId, id, patch);
+    return { item };
+  }
+
+  private todoListRead(): unknown {
+    if (!this.todoListManager || !this.sessionId) {
+      throw new Error('Todo List 功能未初始化');
+    }
+    const items = this.todoListManager.getTodos(this.sessionId);
+    return { items };
+  }
+
+  private todoListDelete(values: Record<string, unknown>): unknown {
+    if (!this.todoListManager || !this.sessionId) {
+      throw new Error('Todo List 功能未初始化');
+    }
+    const id = requiredString(values, 'id', 100);
+    this.todoListManager.deleteTodo(this.sessionId, id);
+    return { deleted: true, id };
+  }
+
+  private async semanticSearch(values: Record<string, unknown>): Promise<unknown> {
+    if (!this.indexingService) {
+      throw new Error('语义搜索功能未初始化');
+    }
+    const query = requiredString(values, 'query', 500);
+    const topK = optionalInteger(values, 'topK', 10, 1, 50);
+    const results: SearchResult[] = await this.indexingService.semanticSearch(query, topK);
+    return { results, query };
   }
 
   private runProcess(command: string, args: string[], shell: boolean, timeoutSeconds: number): Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean; truncated: boolean }> {
@@ -385,4 +575,93 @@ export class WorkspaceToolExecutor {
       }
     }
   }
+}
+
+function applyUnifiedDiff(content: string, diff: string): string {
+  const lines = content.split(/\r?\n/);
+  const diffLines = diff.split(/\r?\n/);
+  const result: string[] = [];
+  let currentLine = 0;
+  let i = 0;
+  let inHunk = false;
+
+  while (i < diffLines.length) {
+    const line = diffLines[i];
+
+    // hunk 外部：跳过文件头和空行
+    if (!inHunk) {
+      if (line.startsWith('---') || line.startsWith('+++') || line.startsWith('diff ') || line.startsWith('index ') || line.trim() === '') {
+        i++;
+        continue;
+      }
+    }
+
+    const hunkMatch = line.match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/);
+    if (hunkMatch) {
+      inHunk = true;
+      const oldStart = parseInt(hunkMatch[1], 10) - 1;
+      const oldCount = hunkMatch[2] !== undefined ? parseInt(hunkMatch[2], 10) : 1;
+
+      while (currentLine < oldStart && currentLine < lines.length) {
+        result.push(lines[currentLine]);
+        currentLine++;
+      }
+      i++;
+      let consumed = 0;
+      while (i < diffLines.length) {
+        const hunkLine = diffLines[i];
+        if (hunkLine.startsWith('@@') || hunkLine.startsWith('---') || hunkLine.startsWith('+++')) {
+          inHunk = false;
+          break;
+        }
+        // "\ No newline at end of file" 标记：跳过
+        if (hunkLine.startsWith('\\')) {
+          i++;
+          continue;
+        }
+        // hunk 内的裸空行视为空上下文行（某些 diff 生成器不补前导空格）
+        if (hunkLine === '') {
+          result.push('');
+          currentLine++;
+          consumed++;
+          i++;
+          continue;
+        }
+        if (hunkLine.startsWith(' ')) {
+          const expected = hunkLine.slice(1);
+          const actual = lines[currentLine] ?? '';
+          if (expected !== actual) {
+            throw new Error(`diff 上下文不匹配：第 ${currentLine + 1} 行期望 "${expected}"，实际 "${actual}"`);
+          }
+          result.push(actual);
+          currentLine++;
+          consumed++;
+        } else if (hunkLine.startsWith('-')) {
+          const actual = lines[currentLine] ?? '';
+          const expected = hunkLine.slice(1);
+          if (actual !== expected) {
+            throw new Error(`diff 删除行不匹配：第 ${currentLine + 1} 行期望 "${expected}"，实际 "${actual}"`);
+          }
+          currentLine++;
+          consumed++;
+        } else if (hunkLine.startsWith('+')) {
+          result.push(hunkLine.slice(1));
+        } else {
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+
+    // hunk 外部的非空非头行：跳过
+    i++;
+  }
+
+  while (currentLine < lines.length) {
+    result.push(lines[currentLine]);
+    currentLine++;
+  }
+
+  return result.join('\n');
 }

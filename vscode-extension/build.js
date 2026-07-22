@@ -47,7 +47,7 @@ async function build() {
   }
 
   // 复制静态资源
-  const assets = ['media/coordinator.svg', 'schema.sql'];
+  const assets = ['media/coordinator.svg', 'schema.sql', 'index-schema.sql'];
   for (const asset of assets) {
     const src = path.join(EXT_DIR, asset);
     if (fs.existsSync(src)) {

@@ -486,6 +486,56 @@ export function registerCommands(
   // ============================================================
 
   disposables.push(
+    vscode.commands.registerCommand('coordinator.rebuildIndex', async () => {
+      const runtime = ctx.getActiveRuntime();
+      if (!runtime) {
+        vscode.window.showWarningMessage('请先切换到工作区');
+        return;
+      }
+      const consoleProvider = ctx.getConsoleProvider();
+      if (!consoleProvider || !consoleProvider.getIndexingService) {
+        vscode.window.showWarningMessage('索引服务未初始化，请确保已配置模型预设');
+        return;
+      }
+      const indexingService = consoleProvider.getIndexingService();
+      if (!indexingService) {
+        vscode.window.showWarningMessage('索引服务未初始化，请确保已配置模型预设的 API Key');
+        return;
+      }
+      const choice = await vscode.window.showWarningMessage(
+        '将重新索引整个代码库，可能需要几分钟。是否继续？',
+        { modal: true },
+        '重建索引',
+      );
+      if (choice !== '重建索引') return;
+
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: '重建代码索引',
+          cancellable: false,
+        },
+        async (progress) => {
+          let lastDone = 0;
+          await indexingService.rebuildIndex((done: number, total: number) => {
+            if (done > lastDone) {
+              progress.report({
+                message: `已索引 ${done}/${total} 文件`,
+                increment: ((done - lastDone) / total) * 100,
+              });
+              lastDone = done;
+            }
+          });
+          const status = indexingService.getStatus();
+          vscode.window.showInformationMessage(
+            `✅ 索引完成：${status.fileCount} 文件，${status.chunkCount} 代码块`,
+          );
+        },
+      );
+    }),
+  );
+
+  disposables.push(
     vscode.commands.registerCommand('coordinator.openDashboard', async () => {
       const runtime = await ctx.ensureActiveWorkspace();
       if (!runtime) return;

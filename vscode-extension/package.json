@@ -10,7 +10,7 @@
     "url": "https://github.com/Leesin596/ai-agent-coordinator.git"
   },
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.93.0"
   },
   "categories": [
     "Other"
@@ -30,7 +30,7 @@
   },
   "devDependencies": {
     "@types/sql.js": "^1.4.9",
-    "@types/vscode": "1.85.0",
+    "@types/vscode": "1.93.0",
     "@types/node": "^18.19.0",
     "esbuild": "^0.28.1",
     "typescript": "^5.7.0"
@@ -171,6 +171,17 @@
         "title": "Dispatch Task",
         "icon": "$(send)",
         "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.codeAction",
+        "title": "Coordinator Code Action",
+        "category": "Coordinator"
+      },
+      {
+        "command": "coordinator.rebuildIndex",
+        "title": "Rebuild Code Index",
+        "icon": "$(refresh)",
+        "category": "Coordinator"
       }
     ],
     "viewsContainers": {
@@ -258,6 +269,63 @@
           "type": "string",
           "default": "gpt-4o-mini",
           "description": "Default LLM Model"
+        },
+        "coordinator.mcp.servers": {
+          "type": "array",
+          "default": [],
+          "description": "MCP Server 配置列表",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string", "description": "Server 名称" },
+              "command": { "type": "string", "description": "启动命令" },
+              "args": { "type": "array", "items": { "type": "string" }, "description": "命令参数" },
+              "env": { "type": "object", "description": "环境变量" },
+              "enabled": { "type": "boolean", "default": true, "description": "是否启用" }
+            },
+            "required": ["name", "command"]
+          }
+        },
+        "coordinator.autoApprove.tools": {
+          "type": "array",
+          "default": [],
+          "description": "自动批准的工具名称列表（如 workspace_read_file, workspace_list_files, workspace_search, git_status, git_diff）",
+          "items": { "type": "string" }
+        },
+        "coordinator.autoApprove.toolGroups": {
+          "type": "array",
+          "default": [],
+          "description": "自动批准的工具组列表。可选值: read（读取类工具）, edit（编辑类工具）, command（命令执行类工具）, mcp（MCP 工具）",
+          "items": { "type": "string", "enum": ["read", "edit", "command", "mcp"] }
+        },
+        "coordinator.autoApprove.always": {
+          "type": "boolean",
+          "default": false,
+          "description": "自动批准所有工具调用（危险！仅用于受信任的隔离环境）"
+        },
+        "coordinator.indexing.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用代码库语义索引（需配置模型预设的 API Key）"
+        },
+        "coordinator.indexing.embeddingModel": {
+          "type": "string",
+          "default": "text-embedding-3-small",
+          "description": "Embedding 模型名称（OpenAI 兼容或 Ollama 模型名）"
+        },
+        "coordinator.indexing.chunkSize": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 20,
+          "maximum": 500,
+          "description": "代码分块行数"
+        },
+        "coordinator.indexing.chunkOverlap": {
+          "type": "integer",
+          "default": 20,
+          "minimum": 0,
+          "maximum": 100,
+          "description": "分块重叠行数"
         }
       }
     }

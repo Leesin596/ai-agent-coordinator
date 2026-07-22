@@ -101,6 +101,8 @@ export class ModelsViewProvider implements vscode.WebviewViewProvider {
       apiKey: preset.apiKey?.trim() || '',
       baseURL: preset.baseURL?.trim() || 'https://api.openai.com/v1',
       model: preset.model?.trim() || 'gpt-4o-mini',
+      apiFormat: preset.apiFormat || 'chat-completions',
+      apiKeyRequired: preset.apiKeyRequired !== false,
       temperature: preset.temperature !== undefined && preset.temperature !== ''
         ? Number(preset.temperature) : 0.7,
     });
@@ -117,6 +119,8 @@ export class ModelsViewProvider implements vscode.WebviewViewProvider {
     if (patch.temperature !== undefined && patch.temperature !== '') {
       clean.temperature = Number(patch.temperature);
     }
+    if (patch.apiFormat !== undefined) clean.apiFormat = patch.apiFormat;
+    if (patch.apiKeyRequired !== undefined) clean.apiKeyRequired = patch.apiKeyRequired !== false;
     await this.store.update(id, clean);
     await this.pushState();
     this._onDidChangeModels.fire();
@@ -437,6 +441,14 @@ export class ModelsViewProvider implements vscode.WebviewViewProvider {
         <input type="text" id="fBaseURL" placeholder="https://api.openai.com/v1">
       </div>
       <div class="field">
+        <label>API 格式</label>
+        <select id="fApiFormat">
+          <option value="responses">Responses (OpenAI)</option>
+          <option value="chat-completions">Chat Completions (OpenAI 兼容)</option>
+          <option value="anthropic-messages">Anthropic Messages</option>
+        </select>
+      </div>
+      <div class="field">
         <label>模型标识</label>
         <input type="text" id="fModel" placeholder="gpt-4o">
         <div class="quick-presets" id="quickPresets"></div>
@@ -545,6 +557,8 @@ export class ModelsViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  let curApiKeyRequired = true;
+
   function renderQuickPresets() {
     $('quickPresets').innerHTML = QUICK_PRESETS.map((p,i) =>
       '<span class="qp-chip" data-i="' + i + '">' + esc(p.name) + '</span>'
@@ -555,6 +569,11 @@ export class ModelsViewProvider implements vscode.WebviewViewProvider {
         if ($('fName').value.trim() === '') $('fName').value = p.name;
         $('fModel').value = p.model;
         $('fBaseURL').value = p.baseURL;
+        if ($('fApiFormat')) $('fApiFormat').value = p.apiFormat || 'chat-completions';
+        curApiKeyRequired = p.apiKeyRequired !== false;
+        if (curApiKeyRequired === false && $('fApiKey').value.trim() === '') {
+          $('fApiKey').value = 'ollama';
+        }
       });
     });
   }
@@ -565,6 +584,8 @@ export class ModelsViewProvider implements vscode.WebviewViewProvider {
     $('fName').value = ''; $('fApiKey').value = '';
     $('fBaseURL').value = 'https://api.openai.com/v1';
     $('fModel').value = 'gpt-4o-mini'; $('fTemp').value = '0.7';
+    if ($('fApiFormat')) $('fApiFormat').value = 'responses';
+    curApiKeyRequired = true;
     renderQuickPresets();
     modal.classList.add('show');
     setTimeout(() => $('fName').focus(), 50);
@@ -580,6 +601,8 @@ export class ModelsViewProvider implements vscode.WebviewViewProvider {
     $('fName').value = m.name; $('fApiKey').value = m.apiKey || '';
     $('fBaseURL').value = m.baseURL || ''; $('fModel').value = m.model || '';
     $('fTemp').value = m.temperature !== undefined ? String(m.temperature) : '0.7';
+    if ($('fApiFormat')) $('fApiFormat').value = m.apiFormat || 'chat-completions';
+    curApiKeyRequired = m.apiKeyRequired !== false;
     renderQuickPresets();
     modal.classList.add('show');
   }
@@ -592,6 +615,8 @@ export class ModelsViewProvider implements vscode.WebviewViewProvider {
       apiKey: $('fApiKey').value,
       baseURL: $('fBaseURL').value,
       model: $('fModel').value,
+      apiFormat: $('fApiFormat') ? $('fApiFormat').value : 'chat-completions',
+      apiKeyRequired: curApiKeyRequired,
       temperature: $('fTemp').value,
     };
     if (!data.name.trim()) { vscode.window?.showWarningMessage?.('请填写名称'); $('fName').focus(); return; }

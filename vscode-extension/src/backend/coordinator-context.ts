@@ -174,6 +174,11 @@ export class CoordinatorContext implements vscode.Disposable {
     return this.modelStore;
   }
 
+  /** 获取扩展安装路径（用于定位 schema 等静态资源） */
+  getExtensionPath(): string {
+    return this.extensionPath;
+  }
+
   // ============================================================
   // 工作区管理
   // ============================================================

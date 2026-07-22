@@ -8,6 +8,8 @@ import { CoordinatorContext } from './backend/coordinator-context';
 import { SidebarViewProvider } from './ui/sidebar-view';
 import { ConsoleViewProvider } from './panel/console-provider';
 import { ChatPanel } from './ui/chat-panel';
+import { CoordinatorCodeActionProvider } from './ui/code-action-provider';
+import { MCPClientManager } from './services/mcp-client';
 import { registerCommands } from './commands';
 
 let ctx: CoordinatorContext | undefined;
@@ -25,6 +27,12 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // 3. 创建底部面板控制台 Provider
     const consoleProvider = new ConsoleViewProvider(ctx);
+
+    // 3.5 初始化 MCP Server 客户端
+    const mcpManager = new MCPClientManager();
+    await mcpManager.connectAll();
+    context.subscriptions.push(mcpManager);
+    consoleProvider.setMCPManager(mcpManager);
 
     // 4. 注册侧边栏 + 底部面板 Webview
     context.subscriptions.push(
@@ -52,6 +60,29 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
       vscode.commands.registerCommand('coordinator.openPanel', () => {
         vscode.commands.executeCommand(`${ConsoleViewProvider.VIEW_ID}.focus`);
+      }),
+    );
+
+    // 9. Code Actions：lightbulb 快捷操作（Explain / Improve / Fix / Add to Context）
+    context.subscriptions.push(
+      vscode.languages.registerCodeActionsProvider(
+        { scheme: 'file' },
+        new CoordinatorCodeActionProvider(),
+        { providedCodeActionKinds: CoordinatorCodeActionProvider.providedCodeActionKinds },
+      ),
+    );
+    context.subscriptions.push(
+      vscode.commands.registerCommand('coordinator.codeAction', async (args: { action: string; code: string; file: string; diagnostics?: string }) => {
+        const prompts: Record<string, string> = {
+          explain: `请解释以下代码（来自 ${args.file}）：\n\n\`\`\`\n${args.code}\n\`\`\``,
+          improve: `请优化以下代码（来自 ${args.file}），指出问题并给出改进建议：\n\n\`\`\`\n${args.code}\n\`\`\``,
+          fix: `请修复以下代码中的问题（来自 ${args.file}）${args.diagnostics ? `：\n\n错误信息：\n${args.diagnostics}\n` : ''}\n\n\`\`\`\n${args.code}\n\`\`\``,
+        };
+        const prompt = prompts[args.action] || `请分析以下代码（来自 ${args.file}）：\n\n\`\`\`\n${args.code}\n\`\`\``;
+        // 聚焦底部控制台并发送消息
+        await vscode.commands.executeCommand(`${ConsoleViewProvider.VIEW_ID}.focus`);
+        // 通过 consoleProvider 发送消息
+        consoleProvider.handleCodeActionPrompt(prompt);
       }),
     );
 

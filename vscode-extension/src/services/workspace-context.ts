@@ -149,6 +149,15 @@ export function buildWorkspaceContext(
     '修改文件时优先使用精确替换；覆盖整个现有文件前必须先读取并传回最新 sha256。',
     '创建、修改、删除文件以及执行命令都会等待用户明确批准；用户拒绝后不要重复相同请求。',
     '命令仅用于当前项目的构建、测试和诊断，必须设置合理超时并根据返回结果继续。',
+    '对于大型代码库，优先使用 workspace_semantic_search 进行语义搜索，它基于自然语言描述查找相关代码位置，比 workspace_search 的字符串匹配更高效。',
+  );
+
+  lines.push(
+    '',
+    '## 任务进度跟踪',
+    '处理多步骤复杂任务时，应先使用 todo_list_create 创建任务清单，再逐步执行。',
+    '开始某一步时用 todo_list_update 标记 in_progress，完成后标记 completed。',
+    '可用 todo_list_read 随时查看当前进度。用户可在侧边栏实时看到任务状态。',
   );
 
   if (sessions.length > 1) {
@@ -163,6 +172,15 @@ export function buildWorkspaceContext(
       '```',
     );
   }
+
+  lines.push(
+    '',
+    '## 自动编排（多角色协作）',
+    '当任务复杂、需要多个角色协作时，使用 orchestrate_task 工具自动编排。',
+    '系统会自动拆解任务、分配给合适的角色会话、等待结果并生成汇总报告。',
+    '参数：description（任务描述）、context（上下文，可选）、maxSubTasks（最大子任务数，默认5）。',
+    '编排是异步操作，执行后需等待所有子任务完成。',
+  );
 
   return lines.join('\n');
 }

@@ -6,7 +6,7 @@ import * as vscode from 'vscode';
 import type { CoordinatorContext } from '../backend/coordinator-context';
 import { ModelStore, MODEL_QUICK_PRESETS } from '../services/model-store';
 import type { ModelApiFormat } from '../services/model-store';
-import { extractApiError, prepareLLMRequest } from '../services/llm-api';
+import { createProvider } from '../services/providers';
 import type { Role, RoleCategory } from '../../../src/models/types';
 import { ROLE_CATEGORY_LABELS } from '../../../src/models/types';
 
@@ -237,17 +237,19 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
   // ─── 模型操作 ───
   private async handleAddModel(preset: any): Promise<void> {
     if (!preset?.name?.trim()) { vscode.window.showWarningMessage('请填写档案名'); return; }
-    if (!preset?.apiKey?.trim()) { vscode.window.showWarningMessage('请填写 API Key'); return; }
+    const apiKeyRequired = preset.apiKeyRequired !== false;
+    if (apiKeyRequired && !preset?.apiKey?.trim()) { vscode.window.showWarningMessage('请填写 API Key'); return; }
     if (!preset?.baseURL?.trim()) { vscode.window.showWarningMessage('请填写 Base URL'); return; }
     await this.store.add({
       name: preset.name.trim(),
-      apiKey: preset.apiKey.trim(),
+      apiKey: preset.apiKey?.trim() || '',
       baseURL: preset.baseURL.trim(),
       model: preset.model?.trim() || 'gpt-5.6-terra',
       apiFormat: (preset.apiFormat || 'responses') as ModelApiFormat,
       thinkingStrength: preset.thinkingStrength || 'xhigh',
       contextWindow: preset.contextWindow ? Number(preset.contextWindow) : 1000000,
       temperature: preset.temperature !== undefined && preset.temperature !== '' ? Number(preset.temperature) : 0.7,
+      apiKeyRequired,
     });
     this.pushModels();
     this._onDidChangeModels.fire();
@@ -262,6 +264,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     if (patch.thinkingStrength !== undefined) clean.thinkingStrength = String(patch.thinkingStrength);
     if (patch.contextWindow !== undefined && patch.contextWindow !== '') clean.contextWindow = Number(patch.contextWindow);
     if (patch.temperature !== undefined && patch.temperature !== '') clean.temperature = Number(patch.temperature);
+    if (patch.apiKeyRequired !== undefined) clean.apiKeyRequired = patch.apiKeyRequired !== false;
     await this.store.update(id, clean);
     this.pushModels();
     this._onDidChangeModels.fire();
@@ -298,45 +301,40 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     try {
-      const https = await import('https');
-      const http = await import('http');
-      const { url, headers, body } = prepareLLMRequest(
+      const provider = createProvider(apiFormat);
+      const prepared = provider.prepareRequest(
         [{ role: 'user', content: 'Hi' }],
-        { apiKey, baseURL, model, apiFormat, maxTokens: 5 },
+        { apiKey, baseURL, model, maxTokens: 5 },
         false,
       );
-      const lib = url.protocol === 'https:' ? https : http;
-      const result = await new Promise<{ success: boolean; message: string }>((resolve) => {
-        const req = lib.request(url, {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      try {
+        const res = await fetch(prepared.url, {
           method: 'POST',
-          headers,
-          timeout: 15000,
-        }, (res) => {
-          let data = '';
-          res.on('data', (chunk) => { data += chunk; });
-          res.on('end', () => {
-            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-              resolve({ success: true, message: `连接成功 (HTTP ${res.statusCode})` });
-            } else if (res.statusCode === 401) {
-              resolve({ success: false, message: `认证失败 (HTTP 401) — API Key 无效` });
-            } else if (res.statusCode === 404) {
-              resolve({ success: false, message: `API 端点不存在 (HTTP 404) — 检查 Base URL 与 API 格式` });
-            } else {
-              resolve({ success: false, message: `HTTP ${res.statusCode}: ${extractApiError(data) || '请求失败'}` });
-            }
-          });
+          headers: prepared.headers,
+          body: prepared.body,
+          signal: controller.signal,
         });
-        req.on('error', (err) => {
-          resolve({ success: false, message: `网络错误: ${err.message}` });
-        });
-        req.on('timeout', () => {
-          req.destroy();
-          resolve({ success: false, message: '请求超时 (15s)' });
-        });
-        req.write(body);
-        req.end();
-      });
-      this.postToWebview({ type: 'testResult', ...result });
+        clearTimeout(timeoutId);
+        if (res.status >= 200 && res.status < 300) {
+          this.postToWebview({ type: 'testResult', success: true, message: `连接成功 (HTTP ${res.status})` });
+        } else if (res.status === 401) {
+          this.postToWebview({ type: 'testResult', success: false, message: `认证失败 (HTTP 401) — API Key 无效` });
+        } else if (res.status === 404) {
+          this.postToWebview({ type: 'testResult', success: false, message: `API 端点不存在 (HTTP 404) — 检查 Base URL 与 API 格式` });
+        } else {
+          const errBody = await res.text();
+          this.postToWebview({ type: 'testResult', success: false, message: `HTTP ${res.status}: ${provider.extractApiError(errBody) || '请求失败'}` });
+        }
+      } catch (err: any) {
+        clearTimeout(timeoutId);
+        if (err.name === 'AbortError') {
+          this.postToWebview({ type: 'testResult', success: false, message: '请求超时 (15s)' });
+        } else {
+          this.postToWebview({ type: 'testResult', success: false, message: `网络错误: ${err.message}` });
+        }
+      }
     } catch (err: any) {
       this.postToWebview({ type: 'testResult', success: false, message: `错误: ${err.message}` });
     }
@@ -1085,6 +1083,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
   document.addEventListener('click', hideCtxMenu);
 
   // ─── 模型表单 ───
+  let curApiKeyRequired = true;
+
   function renderQuickPresets() {
     $('quickPresets').innerHTML = QUICK_PRESETS.map((p,i) => '<span class="qp-chip" data-i="' + i + '">' + esc(p.name) + '</span>').join('');
     $('quickPresets').querySelectorAll('.qp-chip').forEach(c => {
@@ -1094,6 +1094,10 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         $('fModel').value = p.model;
         $('fBaseURL').value = p.baseURL;
         $('fApiFormat').value = p.apiFormat;
+        curApiKeyRequired = p.apiKeyRequired !== false;
+        if (curApiKeyRequired === false && $('fApiKey').value.trim() === '') {
+          $('fApiKey').value = 'ollama';
+        }
       });
     });
   }
@@ -1148,6 +1152,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     const data = {
       name: $('fName').value,
       apiKey: $('fApiKey').value,
+      apiKeyRequired: curApiKeyRequired,
       baseURL: $('fBaseURL').value,
       model: $('fModel').value,
       apiFormat: $('fApiFormat').value,
@@ -1156,7 +1161,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
       temperature: $('fTemp').value,
     };
     if (!data.name.trim()) { $('fName').focus(); return; }
-    if (!data.apiKey.trim()) { $('fApiKey').focus(); return; }
+    if (curApiKeyRequired && !data.apiKey.trim()) { $('fApiKey').focus(); return; }
     if (!data.baseURL.trim()) { $('fBaseURL').focus(); return; }
     modelAdding = false;
     if (modelEditMode === 'add') vscode.postMessage({ type:'addModel', preset:data });

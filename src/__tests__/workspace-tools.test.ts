@@ -6,6 +6,7 @@ import {
   WorkspaceToolExecutor,
   type ToolApprovalRequest,
 } from '../../vscode-extension/src/services/workspace-tools';
+import { CheckpointManager } from '../../vscode-extension/src/services/checkpoint-manager';
 
 function call(name: string, args: Record<string, unknown> = {}): { name: string; arguments: string } {
   return { name, arguments: JSON.stringify(args) };
@@ -148,4 +149,108 @@ describe('WorkspaceToolExecutor', () => {
     executor.cancel();
     await expect(running).rejects.toThrow('工具执行已取消');
   }, 15000);
+
+  it('applies unified diff patches correctly', async () => {
+    fs.writeFileSync(path.join(root, 'src', 'multi.ts'), 'line1\nline2\nline3\nline4\nline5\n');
+    const diff = [
+      '--- a/src/multi.ts',
+      '+++ b/src/multi.ts',
+      '@@ -1,5 +1,5 @@',
+      ' line1',
+      '-line2',
+      '+line2-modified',
+      ' line3',
+      '@@ -4,2 +4,2 @@',
+      ' line4',
+      '-line5',
+      '+line5-modified',
+    ].join('\n');
+    const res = result(await executor.execute(call('workspace_apply_diff', { path: 'src/multi.ts', diff })));
+    expect(res.sha256).toMatch(/^[a-f0-9]{64}$/);
+    const content = fs.readFileSync(path.join(root, 'src', 'multi.ts'), 'utf8');
+    expect(content).toContain('line2-modified');
+    expect(content).toContain('line5-modified');
+    expect(content).toContain('line1');
+    expect(content).toContain('line3');
+  });
+
+  it('rejects empty diffs', async () => {
+    fs.writeFileSync(path.join(root, 'src', 'noop.ts'), 'unchanged\n');
+    await expect(executor.execute(call('workspace_apply_diff', {
+      path: 'src/noop.ts',
+      diff: '@@ -1,1 +1,1 @@\n unchanged\n',
+    }))).rejects.toThrow('未产生任何变化');
+  });
+
+  it('search_replace replaces first match without requiring uniqueness', async () => {
+    fs.writeFileSync(path.join(root, 'src', 'dup.ts'), 'const x = 1;\nconst x = 1;\nconst x = 1;\n');
+    const res = result(await executor.execute(call('workspace_search_replace', {
+      path: 'src/dup.ts',
+      searchText: 'const x = 1;',
+      replaceText: 'const x = 2;',
+    })));
+    expect(res.replacements).toBe(1);
+    const content = fs.readFileSync(path.join(root, 'src', 'dup.ts'), 'utf8');
+    expect(content).toBe('const x = 2;\nconst x = 1;\nconst x = 1;\n');
+  });
+
+  it('search_replace with replaceAll replaces all matches', async () => {
+    fs.writeFileSync(path.join(root, 'src', 'all.ts'), 'foo bar foo bar foo\n');
+    const res = result(await executor.execute(call('workspace_search_replace', {
+      path: 'src/all.ts',
+      searchText: 'foo',
+      replaceText: 'baz',
+      replaceAll: true,
+    })));
+    expect(res.replacements).toBe(3);
+    const content = fs.readFileSync(path.join(root, 'src', 'all.ts'), 'utf8');
+    expect(content).toBe('baz bar baz bar baz\n');
+  });
+
+  it('creates checkpoints and supports rollback', async () => {
+    let gitAvailable = false;
+    try {
+      const { execSync } = await import('child_process');
+      execSync('git --version', { stdio: 'pipe', timeout: 3000 });
+      gitAvailable = true;
+    } catch { /* git not available */ }
+    if (!gitAvailable) return;
+
+    const ckptMgr = new CheckpointManager(root);
+    executor.setCheckpointManager(ckptMgr);
+
+    const original = 'original content\nline2\n';
+    fs.writeFileSync(path.join(root, 'src', 'ckpt.ts'), original);
+
+    const read = result(await executor.execute(call('workspace_read_file', { path: 'src/ckpt.ts' })));
+    await executor.execute(call('workspace_write_file', {
+      path: 'src/ckpt.ts',
+      content: 'modified content\nline2\n',
+      expectedSha256: read.sha256,
+    }));
+
+    expect(fs.readFileSync(path.join(root, 'src', 'ckpt.ts'), 'utf8')).toBe('modified content\nline2\n');
+
+    const checkpoints = ckptMgr.listCheckpoints();
+    expect(checkpoints.length).toBeGreaterThanOrEqual(1);
+
+    ckptMgr.rollback(checkpoints[0].id);
+    expect(fs.readFileSync(path.join(root, 'src', 'ckpt.ts'), 'utf8')).toBe(original);
+
+    executor.setCheckpointManager(null);
+  });
+
+  it('passes toolName in approval requests', async () => {
+    approved = true;
+    await executor.execute(call('workspace_write_file', { path: 'src/new.ts', content: 'test\n' }));
+    expect(approvals.at(-1)?.toolName).toBe('workspace_write_file');
+
+    const read = result(await executor.execute(call('workspace_read_file', { path: 'src/new.ts' })));
+    await executor.execute(call('workspace_replace', {
+      path: 'src/new.ts',
+      oldText: 'test',
+      newText: 'modified',
+    }));
+    expect(approvals.at(-1)?.toolName).toBe('workspace_replace');
+  });
 });
