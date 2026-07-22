@@ -3,6 +3,8 @@
 // 左侧图标导航 + 右侧内容区，切换 工作区/会话/角色/模型
 // ============================================================
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
 import type { CoordinatorContext } from '../backend/coordinator-context';
 import { ModelStore, MODEL_QUICK_PRESETS } from '../services/model-store';
 import type { ModelApiFormat } from '../services/model-store';
@@ -345,6 +347,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
   // ============================================================
   private getHtml(): string {
     const presetsJson = JSON.stringify(MODEL_QUICK_PRESETS);
+    let extVersion = '0.0.0';
+    try {
+      const pkgPath = path.join(this.ctx.getExtensionPath(), 'package.json');
+      extVersion = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version || extVersion;
+    } catch { /* fallback */ }
     return /* html */ `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -656,7 +663,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
 <header class="header-area">
   <div class="header-title">
     <h1>AI Agent Coordinator</h1>
-    <span class="header-version">v0.1.0</span>
+    <span class="header-version">v${extVersion}</span>
   </div>
   <nav class="header-tabs" aria-label="侧边栏功能">
     <button class="header-tab active" type="button" data-tab="models">模型设置</button>
