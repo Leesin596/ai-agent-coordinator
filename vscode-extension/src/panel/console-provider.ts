@@ -738,6 +738,21 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       }
       return this.executeHistorySearch(runtime, sourceSessionId, call);
     }
+    if (call.name === 'web_search' || call.name === 'web_fetch') {
+      const tab = this.tabs.get(sourceSessionId);
+      if (tab && !isToolAllowedByRole(call.name, tab.role)) {
+        throw new Error(`角色「${tab.role.name}」无权使用工具: ${call.name}`);
+      }
+      if (call.name === 'web_search' && !shouldAutoApprove('web_search')) {
+        const approved = await this.requestWebToolApproval(sourceSessionId, 'web_search', call.arguments);
+        if (!approved) throw new Error('用户拒绝了联网搜索');
+      }
+      if (call.name === 'web_fetch' && !shouldAutoApprove('web_fetch')) {
+        const approved = await this.requestWebToolApproval(sourceSessionId, 'web_fetch', call.arguments);
+        if (!approved) throw new Error('用户拒绝了网页抓取');
+      }
+      return this.executeWebTool(runtime, call);
+    }
     if (call.name !== 'dispatch_session_task') {
       const tab = this.tabs.get(sourceSessionId);
       if (!tab) throw new Error('当前会话工具执行器不可用');
@@ -804,6 +819,53 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private async requestWebToolApproval(sessionId: string, toolName: string, args: string): Promise<boolean> {
+    let detail = '';
+    try {
+      const parsed = JSON.parse(args || '{}');
+      detail = parsed.query || parsed.url || JSON.stringify(parsed);
+    } catch {
+      detail = args;
+    }
+    const approvalId = `approval_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    this.postToWebview({
+      type: 'toolApprovalRequest',
+      sessionId,
+      approvalId,
+      title: toolName === 'web_search' ? '允许联网搜索？' : '允许抓取网页？',
+      detail,
+      confirmLabel: '允许',
+      toolName,
+    });
+    return new Promise<boolean>((resolve) => {
+      const timeout = setTimeout(() => {
+        this.pendingApprovals.delete(approvalId);
+        resolve(false);
+      }, 300000);
+      this.pendingApprovals.set(approvalId, { resolve, timeout });
+    });
+  }
+
+  private async executeWebTool(runtime: ActiveWorkspaceRuntime, call: LLMToolCall): Promise<string> {
+    let input: unknown;
+    try {
+      input = JSON.parse(call.arguments || '{}');
+    } catch {
+      throw new Error('工具参数不是有效的 JSON');
+    }
+    if (!input || typeof input !== 'object') throw new Error('工具参数必须是对象');
+    const values = input as Record<string, unknown>;
+    if (call.name === 'web_search') {
+      const result = await runtime.webToolExecutor.search(values);
+      return JSON.stringify({ ok: true, result });
+    }
+    if (call.name === 'web_fetch') {
+      const result = await runtime.webToolExecutor.fetch(values);
+      return JSON.stringify({ ok: true, result });
+    }
+    throw new Error(`不支持的工具: ${call.name}`);
+  }
+
   private async executeOrchestrateTask(
     runtime: ActiveWorkspaceRuntime,
     sourceSessionId: string,
@@ -854,6 +916,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
           sourceSessionId,
           workspaceId: runtime.workspace.id,
           maxSubTasks,
+          maxDepth: 2,
         },
         llmCall,
       );
@@ -1282,7 +1345,6 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
             abortFn: null,
             toolExecutor: new WorkspaceToolExecutor(runtime.workspace.folderPath, async (request) => {
               if (request.toolName && shouldAutoApprove(request.toolName)) return true;
-              if (request.toolName && role.allowedTools?.includes(request.toolName)) return true;
               // Webview 内审批弹窗
               const approvalId = `approval_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
               this.postToWebview({
@@ -2581,6 +2643,7 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       {name:'workspace_list_files', label:'列出文件', group:'读取'},
       {name:'workspace_read_file', label:'读取文件', group:'读取'},
       {name:'workspace_search', label:'搜索内容', group:'读取'},
+      {name:'workspace_semantic_search', label:'语义搜索', group:'读取'},
       {name:'git_status', label:'Git 状态', group:'读取'},
       {name:'git_diff', label:'Git Diff', group:'读取'},
       {name:'workspace_write_file', label:'写入文件', group:'编辑'},
@@ -2590,9 +2653,13 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
       {name:'workspace_delete', label:'删除文件', group:'编辑'},
       {name:'run_command', label:'执行命令', group:'命令'},
       {name:'dispatch_session_task', label:'派发任务', group:'编排'},
+      {name:'orchestrate_task', label:'自动编排', group:'编排'},
       {name:'todo_list_create', label:'创建清单', group:'任务'},
       {name:'todo_list_update', label:'更新清单', group:'任务'},
       {name:'todo_list_read', label:'读取清单', group:'任务'},
+      {name:'history_search', label:'历史搜索', group:'任务'},
+      {name:'web_search', label:'联网搜索', group:'联网'},
+      {name:'web_fetch', label:'网页抓取', group:'联网'},
     ];
     const allowedSet = new Set(r.allowedTools || []);
     const deniedSet = new Set(r.deniedTools || []);
@@ -2775,6 +2842,9 @@ export class ConsoleViewProvider implements vscode.WebviewViewProvider {
     {name:'todo_list_create', label:'创建清单', group:'任务'},
     {name:'todo_list_update', label:'更新清单', group:'任务'},
     {name:'todo_list_read', label:'读取清单', group:'任务'},
+    {name:'history_search', label:'历史搜索', group:'任务'},
+    {name:'web_search', label:'联网搜索', group:'联网'},
+    {name:'web_fetch', label:'网页抓取', group:'联网'},
   ];
   const toolPermModal = $('toolPermModal');
   const toolPermGrid = $('toolPermGrid');

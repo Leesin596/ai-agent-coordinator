@@ -188,6 +188,9 @@ describe('LLM stream protocol compatibility', () => {
       'todo_list_delete',
       'workspace_semantic_search',
       'orchestrate_task',
+      'history_search',
+      'web_search',
+      'web_fetch',
     ]);
   });
 

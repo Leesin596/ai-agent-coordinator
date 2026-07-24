@@ -95,12 +95,16 @@ export class OrchestratorService {
     const maxSubTasks = input.maxSubTasks ?? DEFAULT_MAX_SUB_TASKS;
     const maxDepth = input.maxDepth ?? DEFAULT_MAX_DEPTH;
     const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const currentDepth = input.currentDepth ?? 1;
 
     if (maxDepth < 1) {
       throw new Error('编排深度不能小于 1');
     }
     if (maxSubTasks < 1) {
       throw new Error('最大子任务数不能小于 1');
+    }
+    if (currentDepth > maxDepth) {
+      throw new Error(`编排深度超过限制: 当前 ${currentDepth} 层，最大 ${maxDepth} 层`);
     }
 
     // 1. 拆解任务
@@ -128,6 +132,7 @@ export class OrchestratorService {
       orchestrationId,
       timeoutMs,
       maxDepth,
+      currentDepth,
     );
 
     // 用户取消后跳过汇总，直接返回已收集的部分结果
@@ -297,6 +302,7 @@ export class OrchestratorService {
     orchestrationId: string,
     timeoutMs: number,
     maxDepth: number,
+    currentDepth: number,
   ): Promise<SubTaskResult[]> {
     const results = new Map<number, SubTaskResult>();
     const taskMap = new Map<number, { taskId: string; sessionId: string }>();
@@ -345,6 +351,7 @@ export class OrchestratorService {
               results,
               timeoutMs,
               maxDepth,
+              currentDepth,
             ),
           ),
         );
@@ -424,6 +431,7 @@ export class OrchestratorService {
     completedResults: Map<number, SubTaskResult>,
     timeoutMs: number,
     maxDepth: number,
+    currentDepth: number,
   ): Promise<SubTaskResult> {
     if (!this.dispatcher || !this.sessionManager || !this.roleManager) {
       throw new Error('OrchestratorService 未初始化依赖模块');
@@ -475,7 +483,7 @@ export class OrchestratorService {
       constraints: [
         '本任务由 Orchestrator 自动编排派发',
         `编排 ID: ${orchestrationId}`,
-        `编排深度限制: ${maxDepth}（禁止递归编排超过此深度）`,
+        `编排深度: 当前 ${currentDepth}/${maxDepth} 层（禁止递归编排超过此深度）`,
       ],
     };
 

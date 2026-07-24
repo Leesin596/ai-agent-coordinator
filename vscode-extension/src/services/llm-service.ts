@@ -243,7 +243,7 @@ export class LLMService {
       if (ctx.previousToolCallSignature === currentSignature) {
         ctx.consecutiveIdenticalCount++;
       } else {
-        ctx.consecutiveIdenticalCount = 0;
+        ctx.consecutiveIdenticalCount = 1;
         ctx.previousToolCallSignature = currentSignature;
       }
       if (ctx.consecutiveIdenticalCount >= CONSECUTIVE_IDENTICAL_LIMIT) {
@@ -265,43 +265,55 @@ export class LLMService {
       ];
 
       const processedToolIds = new Set<string>();
-      for (const call of roundResult.toolCalls) {
-        if (isAborted()) return;
-
+      const validCalls = roundResult.toolCalls.filter((call) => {
         if (processedToolIds.has(call.id)) {
           nextMessages.push({
             role: 'tool',
             content: JSON.stringify({ ok: false, error: 'duplicate tool_use_id skipped' }),
             toolCallId: call.id,
           });
-          continue;
+          return false;
         }
         processedToolIds.add(call.id);
+        return true;
+      });
 
+      // 并行执行所有工具调用（像 Windsurf 一样）
+      for (const call of validCalls) {
         yield { type: 'toolStatus', call, status: 'running' };
         yield { type: 'toolCall', call };
+      }
 
-        try {
-          const result = await toolExecutor(call);
-          if (isAborted()) return;
+      const results = await Promise.all(
+        validCalls.map(async (call) => {
+          try {
+            const result = await toolExecutor(call);
+            return { call, result, error: null as string | null };
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            return { call, result: null, error: message };
+          }
+        }),
+      );
 
-          yield { type: 'toolResult', call, result };
-          yield { type: 'toolStatus', call, status: 'completed', detail: result };
+      if (isAborted()) return;
 
+      // 按原始顺序处理结果
+      for (const { call, result, error } of results) {
+        if (error) {
+          yield { type: 'toolStatus', call, status: 'failed', detail: error };
           nextMessages.push(
             call.legacy
-              ? { role: 'function', content: result, toolCallName: call.name }
-              : { role: 'tool', content: result, toolCallId: call.id },
+              ? { role: 'function', content: JSON.stringify({ ok: false, error }), toolCallName: call.name }
+              : { role: 'tool', content: JSON.stringify({ ok: false, error }), toolCallId: call.id },
           );
-        } catch (err) {
-          if (isAborted()) return;
-          const message = err instanceof Error ? err.message : String(err);
-          yield { type: 'toolStatus', call, status: 'failed', detail: message };
-
+        } else {
+          yield { type: 'toolResult', call, result: result! };
+          yield { type: 'toolStatus', call, status: 'completed', detail: result! };
           nextMessages.push(
             call.legacy
-              ? { role: 'function', content: JSON.stringify({ ok: false, error: message }), toolCallName: call.name }
-              : { role: 'tool', content: JSON.stringify({ ok: false, error: message }), toolCallId: call.id },
+              ? { role: 'function', content: result!, toolCallName: call.name }
+              : { role: 'tool', content: result!, toolCallId: call.id },
           );
         }
       }
@@ -327,6 +339,8 @@ export class LLMService {
     holder: { result: RoundResult | null },
   ): AsyncGenerator<StreamChunk> {
     let retryCount = 0;
+    let roundText = '';
+    let roundReasoning = '';
 
     for (;;) {
       if (isAborted()) {
@@ -362,8 +376,8 @@ export class LLMService {
 
         const decoder = new TextDecoder('utf-8');
         let buffer = '';
-        let roundText = '';
-        let roundReasoning = '';
+        roundText = '';
+        roundReasoning = '';
         let reasoningSignature = '';
         const providerItems: Array<Record<string, unknown>> = [];
         const pendingCalls = new Map<number, LLMToolCall>();
@@ -448,11 +462,14 @@ export class LLMService {
         if (toolCalls.length !== allToolCalls.length) {
           throw new Error('模型返回了缺少工具名称的调用');
         }
-        if (new Set(toolCalls.map((call) => call.id)).size !== toolCalls.length) {
-          throw new Error('模型返回了重复的工具调用 ID');
-        }
+        const seenToolCallIds = new Set<string>();
+        const dedupedToolCalls = toolCalls.filter((call) => {
+          if (seenToolCallIds.has(call.id)) return false;
+          seenToolCallIds.add(call.id);
+          return true;
+        });
 
-        holder.result = { toolCalls, roundText, roundReasoning, reasoningSignature, providerItems };
+        holder.result = { toolCalls: dedupedToolCalls, roundText, roundReasoning, reasoningSignature, providerItems };
         return;
       } catch (err) {
         if (isAborted()) {
@@ -460,6 +477,9 @@ export class LLMService {
           return;
         }
         if (retryCount < MAX_RETRIES && !(err instanceof LLMHttpError)) {
+          // 回滚 ctx 中已追加的本轮内容，避免重试后重复输出
+          if (roundText) ctx.fullText = ctx.fullText.slice(0, -roundText.length);
+          if (roundReasoning) ctx.reasoningText = ctx.reasoningText.slice(0, -roundReasoning.length);
           await sleep(RETRY_DELAY_MS);
           if (isAborted()) {
             holder.result = { toolCalls: [], roundText: '', roundReasoning: '', reasoningSignature: '', providerItems: [] };

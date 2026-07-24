@@ -100,6 +100,10 @@ export class IndexingService {
     const config = vscode.workspace.getConfiguration('coordinator.indexing');
     this.chunkSize = config.get<number>('chunkSize', 100);
     this.chunkOverlap = config.get<number>('chunkOverlap', 20);
+    // 校验: overlap 必须小于 chunkSize，否则 step <= 0 会导致死循环
+    if (this.chunkOverlap >= this.chunkSize) {
+      this.chunkOverlap = Math.max(0, this.chunkSize - 1);
+    }
   }
 
   async ensureInitialized(): Promise<void> {
@@ -253,10 +257,7 @@ export class IndexingService {
   private async indexFileInternal(relativePath: string, absolutePath: string): Promise<void> {
     if (!this.db) return;
     const stat = fs.statSync(absolutePath);
-    if (stat.size > MAX_FILE_SIZE) return;
     const buffer = fs.readFileSync(absolutePath);
-    if (isBinary(buffer)) return;
-    const content = buffer.toString('utf8');
     const hash = sha256(buffer);
 
     // 检查是否需要重新索引（sql.js exec 不支持参数，用 prepare 代替）
@@ -269,8 +270,21 @@ export class IndexingService {
     stmt.free();
     if (oldHash !== null && oldHash === hash) return; // 文件未变更，跳过
 
+    // 文件变成不可索引状态时，清理旧索引记录
+    if (stat.size > MAX_FILE_SIZE || isBinary(buffer)) {
+      this.removeFileIndex(relativePath);
+      this.vectorCacheDirty = true;
+      return;
+    }
+
+    const content = buffer.toString('utf8');
     const chunks = this.chunkFile(content);
-    if (chunks.length === 0) return;
+    if (chunks.length === 0) {
+      // 空文件或纯空白文件：清理旧索引记录
+      this.removeFileIndex(relativePath);
+      this.vectorCacheDirty = true;
+      return;
+    }
 
     // 生成 embeddings
     const embeddings = await this.embeddingService.embed(chunks.map((c) => c.content));
@@ -338,7 +352,8 @@ export class IndexingService {
     const countResult = this.db.exec('SELECT COUNT(*) FROM indexed_chunks');
     const totalChunks = countResult.length > 0 ? (countResult[0].values[0][0] as number) : 0;
     if (totalChunks === 0) {
-      throw new Error('代码库尚未建立索引，请先执行索引（命令面板搜索 "Rebuild Code Index"）');
+      // 首次使用时自动索引
+      await this.indexWorkspace();
     }
 
     // 生成查询向量

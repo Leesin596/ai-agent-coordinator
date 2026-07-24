@@ -72,7 +72,6 @@ export class ChatPanel {
     this.session = session;
     this.toolExecutor = new WorkspaceToolExecutor(runtime.workspace.folderPath, async (request) => {
       if (request.toolName && shouldAutoApprove(request.toolName)) return true;
-      if (request.toolName && this.role.allowedTools?.includes(request.toolName)) return true;
       // Webview 内审批弹窗
       const approvalId = `approval_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       this.sendToWebview({
@@ -94,6 +93,14 @@ export class ChatPanel {
     this.toolExecutor.setRole(role);
     this.toolExecutor.setCheckpointManager(new CheckpointManager(runtime.workspace.folderPath));
     this.toolExecutor.setTerminalRunner(this.terminalService.createRunner());
+
+    // 接入 TodoListManager 和 IndexingService（从 ConsoleProvider 获取共享实例）
+    const consoleProvider = ctx.getConsoleProvider();
+    if (consoleProvider) {
+      this.toolExecutor.setTodoListManager(consoleProvider.todoListManager ?? null);
+      this.toolExecutor.setIndexingService(consoleProvider.getIndexingService() ?? null);
+    }
+    this.toolExecutor.setSessionId(session.id);
 
     this.panel.title = `${role.icon || '💬'} ${session.title}`;
 
@@ -462,6 +469,20 @@ export class ChatPanel {
       }
       return this.executeHistorySearch(call);
     }
+    if (call.name === 'web_search' || call.name === 'web_fetch') {
+      if (!isToolAllowedByRole(call.name, this.role)) {
+        throw new Error(`角色「${this.role.name}」无权使用工具: ${call.name}`);
+      }
+      if (call.name === 'web_search' && !shouldAutoApprove('web_search')) {
+        const approved = await this.requestWebToolApproval('web_search', call.arguments);
+        if (!approved) throw new Error('用户拒绝了联网搜索');
+      }
+      if (call.name === 'web_fetch' && !shouldAutoApprove('web_fetch')) {
+        const approved = await this.requestWebToolApproval('web_fetch', call.arguments);
+        if (!approved) throw new Error('用户拒绝了网页抓取');
+      }
+      return this.executeWebTool(call);
+    }
     if (call.name !== 'dispatch_session_task') {
       if (!isToolAllowedByRole(call.name, this.role)) {
         throw new Error(`角色「${this.role.name}」无权使用工具: ${call.name}`);
@@ -522,6 +543,52 @@ export class ChatPanel {
     });
   }
 
+  private async requestWebToolApproval(toolName: string, args: string): Promise<boolean> {
+    let detail = '';
+    try {
+      const parsed = JSON.parse(args || '{}');
+      detail = parsed.query || parsed.url || JSON.stringify(parsed);
+    } catch {
+      detail = args;
+    }
+    const approvalId = `approval_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    this.sendToWebview({
+      type: 'toolApprovalRequest',
+      approvalId,
+      title: toolName === 'web_search' ? '允许联网搜索？' : '允许抓取网页？',
+      detail,
+      confirmLabel: '允许',
+      toolName,
+    });
+    return new Promise<boolean>((resolve) => {
+      const timeout = setTimeout(() => {
+        this.pendingApprovals.delete(approvalId);
+        resolve(false);
+      }, 300000);
+      this.pendingApprovals.set(approvalId, { resolve, timeout });
+    });
+  }
+
+  private async executeWebTool(call: LLMToolCall): Promise<string> {
+    let input: unknown;
+    try {
+      input = JSON.parse(call.arguments || '{}');
+    } catch {
+      throw new Error('工具参数不是有效的 JSON');
+    }
+    if (!input || typeof input !== 'object') throw new Error('工具参数必须是对象');
+    const values = input as Record<string, unknown>;
+    if (call.name === 'web_search') {
+      const result = await this.runtime.webToolExecutor.search(values);
+      return JSON.stringify({ ok: true, result });
+    }
+    if (call.name === 'web_fetch') {
+      const result = await this.runtime.webToolExecutor.fetch(values);
+      return JSON.stringify({ ok: true, result });
+    }
+    throw new Error(`不支持的工具: ${call.name}`);
+  }
+
   private async executeOrchestrateTask(call: LLMToolCall): Promise<string> {
     let input: unknown;
     try {
@@ -568,6 +635,7 @@ export class ChatPanel {
           sourceSessionId: this.session.id,
           workspaceId: this.runtime.workspace.id,
           maxSubTasks,
+          maxDepth: 2,
         },
         llmCall,
       );
@@ -2369,6 +2437,9 @@ export class ChatPanel {
     {name:'todo_list_create', label:'创建清单', group:'任务'},
     {name:'todo_list_update', label:'更新清单', group:'任务'},
     {name:'todo_list_read', label:'读取清单', group:'任务'},
+    {name:'history_search', label:'历史搜索', group:'任务'},
+    {name:'web_search', label:'联网搜索', group:'联网'},
+    {name:'web_fetch', label:'网页抓取', group:'联网'},
   ];
   const toolPermModal = document.getElementById('toolPermModal');
   const toolPermGrid = document.getElementById('toolPermGrid');

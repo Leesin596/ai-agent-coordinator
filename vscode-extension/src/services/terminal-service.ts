@@ -52,7 +52,7 @@ export class TerminalService {
       return {
         stdout: '[命令已在 VS Code 终端中执行，请查看终端输出]',
         stderr: '',
-        exitCode: 0,
+        exitCode: null,
         timedOut: false,
         truncated: false,
       };

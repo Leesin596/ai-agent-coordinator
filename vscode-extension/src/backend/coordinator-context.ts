@@ -18,6 +18,7 @@ import { SessionTaskDispatcher } from '../../../src/core/session-task-dispatcher
 import { SessionManager } from '../../../src/core/session-manager';
 import type { Workspace, Role } from '../../../src/models/types';
 import { ModelStore } from '../services/model-store';
+import { WebToolExecutor } from '../services/web-tools';
 import * as vscode from 'vscode';
 
 /**
@@ -35,6 +36,7 @@ export interface ActiveWorkspaceRuntime {
   roleManager: RoleManager;
   dispatcher: SessionTaskDispatcher;
   sessionManager: SessionManager;
+  webToolExecutor: WebToolExecutor;
 }
 
 export class CoordinatorContext implements vscode.Disposable {
@@ -264,6 +266,8 @@ export class CoordinatorContext implements vscode.Disposable {
       const sessionManager = new SessionManager();
       sessionManager.setDB(db);
 
+      const webToolExecutor = new WebToolExecutor();
+
       this.active = {
         workspace: ws,
         db,
@@ -275,6 +279,7 @@ export class CoordinatorContext implements vscode.Disposable {
         roleManager,
         dispatcher,
         sessionManager,
+        webToolExecutor,
       };
 
       // 更新最后激活时间

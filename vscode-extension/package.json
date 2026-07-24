@@ -295,13 +295,68 @@
         "coordinator.autoApprove.toolGroups": {
           "type": "array",
           "default": [],
-          "description": "自动批准的工具组列表。可选值: read（读取类工具）, edit（编辑类工具）, command（命令执行类工具）, mcp（MCP 工具）",
-          "items": { "type": "string", "enum": ["read", "edit", "command", "mcp"] }
+          "description": "自动批准的工具组列表。可选值: read（读取类工具）, edit（编辑类工具）, command（命令执行类工具）, web（联网工具）, mcp（MCP 工具）",
+          "items": { "type": "string", "enum": ["read", "edit", "command", "web", "mcp"] }
         },
         "coordinator.autoApprove.always": {
           "type": "boolean",
           "default": false,
           "description": "自动批准所有工具调用（危险！仅用于受信任的隔离环境）"
+        },
+        "coordinator.web.searchProvider": {
+          "type": "string",
+          "enum": ["bing", "duckduckgo", "baidu", "mojeek", "searxng", "tavily", "brave"],
+          "default": "bing",
+          "description": "联网搜索引擎。bing/baidu/mojeek/duckduckgo 无需 API Key；tavily/brave 需配置 searchApiKey；searxng 需配置 searxngUrl"
+        },
+        "coordinator.web.searchApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "搜索 API Key，仅 tavily/brave 引擎需要"
+        },
+        "coordinator.web.searxngUrl": {
+          "type": "string",
+          "default": "",
+          "description": "SearXNG 实例 URL，仅 searxng 引擎需要（如 http://localhost:8080）"
+        },
+        "coordinator.web.jinaReaderEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "web_fetch 优先使用 Jina Reader 将网页转 Markdown（免费有限流），限流时自动降级本地 HTML 解析"
+        },
+        "coordinator.web.denyDomains": {
+          "type": "array",
+          "default": ["localhost", "127.0.0.1", "0.0.0.0"],
+          "items": { "type": "string" },
+          "description": "web_fetch 禁止访问的域名黑名单"
+        },
+        "coordinator.web.maxFetchSize": {
+          "type": "integer",
+          "default": 50000,
+          "minimum": 1000,
+          "maximum": 200000,
+          "description": "web_fetch 返回内容最大字符数"
+        },
+        "coordinator.web.requestTimeoutMs": {
+          "type": "integer",
+          "default": 10000,
+          "minimum": 5000,
+          "maximum": 60000,
+          "description": "联网请求超时时间（毫秒）"
+        },
+        "coordinator.web.searchFetchCount": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 0,
+          "maximum": 5,
+          "description": "web_search 后自动抓取前 N 条结果的网页正文（0=关闭深度抓取，仅返回摘要）"
+        },
+        "coordinator.web.searchFetchLength": {
+          "type": "integer",
+          "default": 4000,
+          "minimum": 1000,
+          "maximum": 20000,
+          "description": "深度抓取时每条结果的正文最大字符数"
         },
         "coordinator.indexing.enabled": {
           "type": "boolean",

@@ -164,9 +164,11 @@ CREATE INDEX IF NOT EXISTS idx_chunks_file ON indexed_chunks(file_path);
     }
   });
 
-  it('returns empty results for empty index', async () => {
+  it('auto-indexes on first search when index is empty', async () => {
     await service.ensureInitialized();
-    await expect(service.semanticSearch('test')).rejects.toThrow('尚未建立索引');
+    // 空索引时首次搜索应自动触发索引而非抛异常
+    const results = await service.semanticSearch('test');
+    expect(Array.isArray(results)).toBe(true);
   });
 
   it('skips unchanged files on re-index (incremental)', async () => {

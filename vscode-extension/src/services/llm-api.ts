@@ -263,6 +263,41 @@ export const COORDINATOR_LLM_TOOLS: LLMToolDefinition[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'web_search',
+    description: '搜索互联网，返回标题、URL、摘要及网页正文。默认使用 Jina Search API（一次请求返回结果+正文，速度快），失败降级 Bing/DuckDuckGo。零配置开箱即用，无需 API Key。支持 queries 数组同时搜索多个关键词并合并去重结果，适合需要从多角度搜索的场景。可使用 recencyDays 参数过滤近期内容。',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '搜索关键词（与 queries 二选一）' },
+        queries: {
+          type: 'array',
+          items: { type: 'string' },
+          maxItems: 5,
+          description: '多个搜索关键词，并行搜索后合并去重结果。例如 ["Claude 4 release date", "Anthropic latest model 2025"]',
+        },
+        maxResults: { type: 'integer', minimum: 1, maximum: 10, description: '每个关键词返回结果数，默认 5' },
+        fetchContent: { type: 'boolean', description: '是否自动抓取结果正文，默认 true。设为 false 可加速搜索但仅返回摘要' },
+        recencyDays: { type: 'integer', minimum: 1, maximum: 365, description: '只返回最近 N 天内的结果。查询最新信息时建议设为 30-90' },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'web_fetch',
+    description: '抓取指定 URL 的网页内容，转为干净的 Markdown 返回。优先使用 Jina Reader（高质量 Markdown），限流时降级本地 HTML 解析。可提供 prompt 参数描述你想从页面中查找的信息，系统会据此截取最相关的段落。',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: '要抓取的网页 URL，必须以 http:// 或 https:// 开头' },
+        prompt: { type: 'string', description: '描述你想从页面中查找的信息，例如"Claude 最新模型版本"。系统会据此截取最相关段落而非盲目取前 N 字' },
+        maxLength: { type: 'integer', minimum: 500, maximum: 50000, description: '返回内容最大字符数，默认 8000' },
+      },
+      required: ['url'],
+      additionalProperties: false,
+    },
+  },
 ];
 
 /** API 返回的真实 token 用量 */

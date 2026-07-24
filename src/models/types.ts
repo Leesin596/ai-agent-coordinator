@@ -437,6 +437,8 @@ export interface OrchestrateInput {
   maxSubTasks?: number;
   /** 编排深度（默认 2，防止递归编排） */
   maxDepth?: number;
+  /** 当前编排深度（内部递归追踪，外部调用不传） */
+  currentDepth?: number;
   /** 等待子任务完成的超时时间（毫秒，默认 120000） */
   timeoutMs?: number;
 }

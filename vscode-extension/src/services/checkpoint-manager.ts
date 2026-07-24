@@ -130,12 +130,16 @@ export class CheckpointManager {
 
       // 恢复 checkpoint 时的文件
       for (const file of checkpointFiles) {
-        const src = path.join(this.shadowRepo, file);
         const dest = path.join(this.workspaceRoot, file);
-        if (fs.existsSync(src)) {
+        try {
+          const content = execFileSync('git', ['show', `${checkpointId}:${file}`], {
+            cwd: this.shadowRepo,
+            stdio: 'pipe',
+            timeout: 10000,
+          });
           fs.mkdirSync(path.dirname(dest), { recursive: true });
-          fs.copyFileSync(src, dest);
-        } else {
+          fs.writeFileSync(dest, content);
+        } catch {
           if (fs.existsSync(dest)) fs.unlinkSync(dest);
         }
       }
